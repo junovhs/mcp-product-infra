@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Bash(cargo test:*)",
+      "PowerShell(neti check *)",
+      "PowerShell(ishoo set *)"
+    ]
+  }
+}
