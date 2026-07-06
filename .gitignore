@@ -2,3 +2,7 @@
 Cargo.lock
 .DS_Store
 *.swp
+.ishoo/
+**/.ishoo/*.local.toml
+**/.ishoo/cache/
+**/.ishoo/worktrees/
