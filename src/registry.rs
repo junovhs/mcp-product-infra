@@ -69,10 +69,9 @@ pub fn dispatch_op(
     ctx: &crate::types::ToolContext,
     args: &Value,
 ) -> crate::types::ToolResult {
-    let op = args
-        .get("op")
-        .and_then(Value::as_str)
-        .ok_or_else(|| crate::types::ToolError::invalid_params(format!("{entity} requires an `op` field")))?;
+    let op = args.get("op").and_then(Value::as_str).ok_or_else(|| {
+        crate::types::ToolError::invalid_params(format!("{entity} requires an `op` field"))
+    })?;
 
     for (name, handler) in table {
         if *name == op {

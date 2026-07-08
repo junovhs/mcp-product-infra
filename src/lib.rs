@@ -14,10 +14,14 @@ pub mod server;
 pub mod sidecar;
 pub mod types;
 
-pub use adapters::{AdapterAction, HostConfigFact, HostInstall, HostReadinessReport, HostServer, InstallReport};
-pub use manifest::{HandlerCommand, HandlerRequest, HandlerResponse, Manifest, ManifestMutation, ManifestTool};
+pub use adapters::{
+    AdapterAction, HostConfigFact, HostInstall, HostReadinessReport, HostServer, InstallReport,
+};
+pub use manifest::{
+    HandlerCommand, HandlerRequest, HandlerResponse, Manifest, ManifestMutation, ManifestTool,
+};
 pub use registry::ToolRegistry;
 pub use response::{error_frame, result_frame, tool_ok};
-pub use server::{McpServer, ServerConfig};
+pub use server::{McpServer, OwnerProse, ServerConfig};
 pub use sidecar::{OwnerEndpoint, OwnerRecovery, SidecarConfig};
 pub use types::{MutationKind, ToolContext, ToolError, ToolResult, ToolSpec};

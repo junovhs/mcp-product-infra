@@ -1,10 +1,12 @@
-use turnkey_mcp::{McpServer, ServerConfig, ToolError, ToolSpec};
 use serde_json::json;
+use turnkey_mcp::{McpServer, ServerConfig, ToolError, ToolSpec};
 
 fn main() {
     let server = McpServer::new(
         ServerConfig::new("todo", env!("CARGO_PKG_VERSION"), ".")
-            .instructions("This app is controlled through todo_* MCP tools. Start with todo_status.")
+            .instructions(
+                "This app is controlled through todo_* MCP tools. Start with todo_status.",
+            )
             .tool(ToolSpec::read(
                 "todo_status",
                 "Return a tiny app status payload.",

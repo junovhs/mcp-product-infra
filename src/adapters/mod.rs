@@ -88,12 +88,14 @@ impl HostInstall {
     }
 
     pub fn install_repo(&self, repo_root: &Path) -> Result<InstallReport, String> {
-        let repo_root = find_git_root(repo_root)
-            .ok_or_else(|| "not inside a git repository".to_string())?;
+        let repo_root =
+            find_git_root(repo_root).ok_or_else(|| "not inside a git repository".to_string())?;
         let mut files = Vec::new();
         files.push((
             ".mcp.json".to_string(),
-            with_action(&repo_root.join(".mcp.json"), || self.ensure_mcp_json(&repo_root))?,
+            with_action(&repo_root.join(".mcp.json"), || {
+                self.ensure_mcp_json(&repo_root)
+            })?,
         ));
         files.push((
             ".codex/config.toml".to_string(),
@@ -127,7 +129,10 @@ impl HostInstall {
                 })?,
             ));
         }
-        Ok(InstallReport { root: repo_root, files })
+        Ok(InstallReport {
+            root: repo_root,
+            files,
+        })
     }
 
     pub fn install_user(&self) -> Result<InstallReport, String> {
@@ -135,13 +140,20 @@ impl HostInstall {
         let mut files = Vec::new();
         files.push((
             paths.codex_config.display().to_string(),
-            with_action(&paths.codex_config, || self.ensure_codex_user_config(&paths.codex_config))?,
+            with_action(&paths.codex_config, || {
+                self.ensure_codex_user_config(&paths.codex_config)
+            })?,
         ));
         files.push((
             paths.claude_json.display().to_string(),
-            with_action(&paths.claude_json, || self.ensure_claude_user_config(&paths.claude_json))?,
+            with_action(&paths.claude_json, || {
+                self.ensure_claude_user_config(&paths.claude_json)
+            })?,
         ));
-        Ok(InstallReport { root: paths.home, files })
+        Ok(InstallReport {
+            root: paths.home,
+            files,
+        })
     }
 
     pub fn remove_user(&self) -> Result<InstallReport, String> {
@@ -149,13 +161,20 @@ impl HostInstall {
         let mut files = Vec::new();
         files.push((
             paths.codex_config.display().to_string(),
-            with_action(&paths.codex_config, || self.remove_codex_user_config(&paths.codex_config))?,
+            with_action(&paths.codex_config, || {
+                self.remove_codex_user_config(&paths.codex_config)
+            })?,
         ));
         files.push((
             paths.claude_json.display().to_string(),
-            with_action(&paths.claude_json, || self.remove_claude_user_config(&paths.claude_json))?,
+            with_action(&paths.claude_json, || {
+                self.remove_claude_user_config(&paths.claude_json)
+            })?,
         ));
-        Ok(InstallReport { root: paths.home, files })
+        Ok(InstallReport {
+            root: paths.home,
+            files,
+        })
     }
 
     pub fn readiness(&self, repo_root: &Path) -> Vec<HostReadinessReport> {
@@ -180,15 +199,23 @@ impl HostInstall {
             Err(_) => json!({ "mcpServers": {} }),
             Ok(existing) => match serde_json::from_str::<Value>(&existing) {
                 Ok(v) if v.is_object() => v,
-                _ => return Ok(Materialized::Skipped(".mcp.json is not parseable JSON".to_string())),
+                _ => {
+                    return Ok(Materialized::Skipped(
+                        ".mcp.json is not parseable JSON".to_string(),
+                    ))
+                }
             },
         };
         let Some(root) = doc.as_object_mut() else {
-            return Ok(Materialized::Skipped(".mcp.json is not a JSON object".to_string()));
+            return Ok(Materialized::Skipped(
+                ".mcp.json is not a JSON object".to_string(),
+            ));
         };
         let servers = root.entry("mcpServers").or_insert_with(|| json!({}));
         let Some(servers) = servers.as_object_mut() else {
-            return Ok(Materialized::Skipped(".mcp.json `mcpServers` is not an object".to_string()));
+            return Ok(Materialized::Skipped(
+                ".mcp.json `mcpServers` is not an object".to_string(),
+            ));
         };
         for server in &self.servers {
             servers
@@ -240,7 +267,9 @@ impl HostInstall {
             .entry("mcp_servers".to_string())
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
         let Some(servers) = servers.as_table_mut() else {
-            return Ok(Materialized::Skipped("Codex `mcp_servers` is not a table".to_string()));
+            return Ok(Materialized::Skipped(
+                "Codex `mcp_servers` is not a table".to_string(),
+            ));
         };
         for server in &self.servers {
             if let Some(existing) = servers.get(&server.name) {
@@ -298,11 +327,15 @@ impl HostInstall {
             },
         };
         let Some(root) = doc.as_object_mut() else {
-            return Ok(Materialized::Skipped("Claude config is not an object".to_string()));
+            return Ok(Materialized::Skipped(
+                "Claude config is not an object".to_string(),
+            ));
         };
         let servers = root.entry("mcpServers").or_insert_with(|| json!({}));
         let Some(servers) = servers.as_object_mut() else {
-            return Ok(Materialized::Skipped("Claude `mcpServers` is not an object".to_string()));
+            return Ok(Materialized::Skipped(
+                "Claude `mcpServers` is not an object".to_string(),
+            ));
         };
         for server in &self.servers {
             if let Some(existing) = servers.get(&server.name) {
@@ -366,15 +399,21 @@ impl HostInstall {
             },
         };
         let Some(root) = doc.as_object_mut() else {
-            return Ok(Materialized::Skipped("Claude settings is not an object".to_string()));
+            return Ok(Materialized::Skipped(
+                "Claude settings is not an object".to_string(),
+            ));
         };
         let permissions = root.entry("permissions").or_insert_with(|| json!({}));
         let Some(permissions) = permissions.as_object_mut() else {
-            return Ok(Materialized::Skipped("Claude `permissions` is not an object".to_string()));
+            return Ok(Materialized::Skipped(
+                "Claude `permissions` is not an object".to_string(),
+            ));
         };
         let allow = permissions.entry("allow").or_insert_with(|| json!([]));
         let Some(allow) = allow.as_array_mut() else {
-            return Ok(Materialized::Skipped("Claude `permissions.allow` is not an array".to_string()));
+            return Ok(Materialized::Skipped(
+                "Claude `permissions.allow` is not an array".to_string(),
+            ));
         };
         for command in &self.claude_allowed_commands {
             if !allow.iter().any(|v| v.as_str() == Some(command)) {
@@ -403,10 +442,14 @@ impl HostInstall {
                 _ => format!("{block}\n{existing}"),
             },
         };
-        if fs::read_to_string(path).map(|c| c == new_text).unwrap_or(false) {
+        if fs::read_to_string(path)
+            .map(|c| c == new_text)
+            .unwrap_or(false)
+        {
             return Ok(Materialized::Wrote);
         }
-        fs::write(path, new_text).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        fs::write(path, new_text)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
         Ok(Materialized::Wrote)
     }
 }
@@ -535,16 +578,29 @@ fn parse_toml_materialized(existing: &str, label: &str) -> Result<toml::Table, M
 
 fn codex_server_toml(server: &HostServer) -> toml::Value {
     let mut table = toml::Table::new();
-    table.insert("command".to_string(), toml::Value::String(server.command.clone()));
+    table.insert(
+        "command".to_string(),
+        toml::Value::String(server.command.clone()),
+    );
     table.insert(
         "args".to_string(),
-        toml::Value::Array(server.args.iter().cloned().map(toml::Value::String).collect()),
+        toml::Value::Array(
+            server
+                .args
+                .iter()
+                .cloned()
+                .map(toml::Value::String)
+                .collect(),
+        ),
     );
     if !server.codex_approval_tools.is_empty() {
         let mut tools = toml::Table::new();
         for tool in &server.codex_approval_tools {
             let mut mode = toml::Table::new();
-            mode.insert("approval_mode".to_string(), toml::Value::String("approve".to_string()));
+            mode.insert(
+                "approval_mode".to_string(),
+                toml::Value::String("approve".to_string()),
+            );
             tools.insert(tool.clone(), toml::Value::Table(mode));
         }
         table.insert("tools".to_string(), toml::Value::Table(tools));
@@ -601,7 +657,9 @@ fn claude_server_is_owned(value: &Value, expected: &HostServer) -> bool {
 fn command_name_matches(actual: &str, expected: &str) -> bool {
     actual == expected
         || Path::new(actual).file_name().and_then(|name| name.to_str())
-            == Path::new(expected).file_name().and_then(|name| name.to_str())
+            == Path::new(expected)
+                .file_name()
+                .and_then(|name| name.to_str())
 }
 
 fn inspect_claude_config(path: &Path, expected: &[HostServer]) -> HostConfigFact {
@@ -770,7 +828,8 @@ fn ensure_claude_gitignore(repo_root: &Path) -> Result<Materialized, String> {
 
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
     let mut text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
     text.push('\n');
@@ -779,7 +838,8 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
 
 fn write_toml(path: &Path, table: &toml::Table) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
     let mut text = toml::to_string_pretty(table).map_err(|e| e.to_string())?;
     if !text.ends_with('\n') {
@@ -843,8 +903,7 @@ mod tests {
         fs::create_dir_all(dir.path().join(".git")).unwrap();
         fs::create_dir_all(dir.path().join(".codex")).unwrap();
         fs::write(dir.path().join(".codex/config.toml"), "not = [toml").unwrap();
-        let install = HostInstall::new("todo")
-            .server(HostServer::stdio("todo", "todo", ["mcp"]));
+        let install = HostInstall::new("todo").server(HostServer::stdio("todo", "todo", ["mcp"]));
         let report = install.install_repo(dir.path()).unwrap();
         let codex = report
             .files

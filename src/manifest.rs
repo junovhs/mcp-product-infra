@@ -74,10 +74,20 @@ pub struct HandlerResponse {
 
 impl HandlerResponse {
     pub fn success(result: Value) -> Self {
-        Self { ok: true, result: Some(result), code: None, message: None }
+        Self {
+            ok: true,
+            result: Some(result),
+            code: None,
+            message: None,
+        }
     }
 
     pub fn error(code: i64, message: impl Into<String>) -> Self {
-        Self { ok: false, result: None, code: Some(code), message: Some(message.into()) }
+        Self {
+            ok: false,
+            result: None,
+            code: Some(code),
+            message: Some(message.into()),
+        }
     }
 }

@@ -30,6 +30,60 @@ const DEFAULT_PARENT_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 pub type MutationHook =
     Arc<dyn Fn(&ToolContext, &str, &mut Value) -> Result<(), String> + Send + Sync + 'static>;
 
+/// The prose (and JSON-RPC code) of the fail-closed owner-unavailable errors,
+/// so an app's agents see the app's own vocabulary ("store service", "resident
+/// store owner", the app's exact restart command) instead of generic library
+/// wording. The message SHAPES are fixed — only the nouns and the remedy vary —
+/// so hosts and tests can rely on the structure.
+#[derive(Clone, Debug)]
+pub struct OwnerProse {
+    /// JSON-RPC error code for a refused mutation (server-error range).
+    pub code: i64,
+    /// Leading clause, e.g. "store service unavailable — write refused; no
+    /// changes were made."
+    pub prefix: String,
+    /// What the owner is called, e.g. "resident store owner".
+    pub owner_noun: String,
+    /// The remedy clause without the trailing "and retry.", e.g.
+    /// "Restart MyApp (or run `myapp owner`)".
+    pub restart_hint: String,
+}
+
+impl Default for OwnerProse {
+    fn default() -> Self {
+        Self {
+            code: OWNER_SERVICE_UNAVAILABLE,
+            prefix: "resident owner unavailable — mutation refused; no changes were made."
+                .to_string(),
+            owner_noun: "resident owner".to_string(),
+            restart_hint: "Restart the app owner process".to_string(),
+        }
+    }
+}
+
+impl OwnerProse {
+    fn live_but_unreachable(&self) -> String {
+        format!(
+            "{} The {} is running but did not respond in time. Retry in a moment.",
+            self.prefix, self.owner_noun
+        )
+    }
+
+    fn reelected_unreachable(&self, error: &str) -> String {
+        format!(
+            "{} A fresh {} was elected but could not be reached ({error}). {} and retry.",
+            self.prefix, self.owner_noun, self.restart_hint
+        )
+    }
+
+    fn down(&self, error: &str) -> String {
+        format!(
+            "{} The {} is down and could not be re-elected ({error}). {} and retry.",
+            self.prefix, self.owner_noun, self.restart_hint
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct ServerConfig {
     pub app_name: String,
@@ -43,6 +97,26 @@ pub struct ServerConfig {
     /// `McpServer` without this field set, then pass `server.handle_line` to
     /// `sidecar::run_owner_server`.
     pub sidecar: Option<SidecarConfig>,
+    /// When false, a failed owner election at startup runs the server WITHOUT
+    /// an owner instead of exiting — the transport still initializes and
+    /// advertises tools so the agent can explain the setup path (e.g. a
+    /// user-scope registration opened in a brand-new repo with no app state
+    /// yet). Keep true (the default) when app state exists, because writes
+    /// require the resident single owner.
+    pub sidecar_required: bool,
+    /// The vocabulary of the fail-closed owner-unavailable errors.
+    pub owner_prose: OwnerProse,
+    /// Which read tools get the `mcp_owner: unreachable` annotation when a read
+    /// degrades to in-process handling because the owner did not answer.
+    /// `None` = annotate every degraded read; `Some(names)` = only these tools
+    /// (e.g. only the app's status/orientation tool).
+    pub annotate_degraded_reads: Option<Vec<String>>,
+    /// The `source` string inside the `mcp_owner` annotation.
+    pub read_annotation_source: String,
+    /// Env-var prefix for runtime overrides: `{PREFIX}_MCP_SHUTDOWN_DRAIN_MS`
+    /// and `{PREFIX}_MCP_PARENT_WATCHDOG_MS`. Defaults to the app name
+    /// uppercased with non-alphanumerics folded to `_`.
+    pub env_prefix: String,
 }
 
 impl ServerConfig {
@@ -54,12 +128,17 @@ impl ServerConfig {
         let app_name = app_name.into();
         Self {
             context: ToolContext::new(app_name.clone(), workspace_root),
+            env_prefix: default_env_prefix(&app_name),
             app_name,
             version: version.into(),
             instructions: None,
             registry: ToolRegistry::new(),
             mutation_hook: None,
             sidecar: None,
+            sidecar_required: true,
+            owner_prose: OwnerProse::default(),
+            annotate_degraded_reads: None,
+            read_annotation_source: "turnkey_mcp_sidecar".to_string(),
         }
     }
 
@@ -87,6 +166,56 @@ impl ServerConfig {
         self.sidecar = Some(config);
         self
     }
+
+    /// Tolerate a failed owner election at startup (run ownerless) instead of
+    /// exiting. See `sidecar_required`.
+    pub fn sidecar_optional(mut self) -> Self {
+        self.sidecar_required = false;
+        self
+    }
+
+    pub fn owner_prose(mut self, prose: OwnerProse) -> Self {
+        self.owner_prose = prose;
+        self
+    }
+
+    /// Annotate only these read tools when a read degrades past an unreachable
+    /// owner (default: all degraded reads are annotated).
+    pub fn annotate_degraded_reads(
+        mut self,
+        tools: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.annotate_degraded_reads = Some(tools.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn read_annotation_source(mut self, source: impl Into<String>) -> Self {
+        self.read_annotation_source = source.into();
+        self
+    }
+
+    pub fn env_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.env_prefix = prefix.into();
+        self
+    }
+}
+
+fn default_env_prefix(app_name: &str) -> String {
+    let folded: String = app_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if folded.is_empty() {
+        "TURNKEY".to_string()
+    } else {
+        folded
+    }
 }
 
 #[derive(Clone)]
@@ -107,6 +236,16 @@ impl McpServer {
         let owner = match &self.config.sidecar {
             Some(config) => match sidecar::ensure_owner_process(config) {
                 Ok(endpoint) => Some(endpoint),
+                Err(error) if !self.config.sidecar_required => {
+                    // Fail open by explicit opt-in only: the transport still
+                    // initializes and advertises tools so the agent can explain
+                    // the setup path; tool calls run in-process.
+                    eprintln!(
+                        "{} mcp: running without a resident owner ({error})",
+                        self.config.app_name
+                    );
+                    None
+                }
                 Err(error) => {
                     eprintln!("{} mcp error: {error}", self.config.app_name);
                     return 1;
@@ -117,7 +256,7 @@ impl McpServer {
 
         let (events_tx, events_rx) = mpsc::channel();
         spawn_stdin_reader(events_tx.clone());
-        spawn_parent_watchdog(events_tx.clone());
+        spawn_parent_watchdog(&self.config.env_prefix, events_tx.clone());
 
         let dispatch = Dispatch::new(self.clone(), events_tx, owner);
         let stdout = io::stdout();
@@ -135,9 +274,9 @@ impl McpServer {
                     }
                     match events_rx.recv_timeout(deadline.saturating_duration_since(now)) {
                         Ok(event) => event,
-                        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
-                            break
-                        }
+                        Err(
+                            mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected,
+                        ) => break,
                     }
                 }
                 None => match events_rx.recv() {
@@ -159,7 +298,8 @@ impl McpServer {
                     if active_requests == 0 {
                         break;
                     }
-                    shutdown_deadline = Some(Instant::now() + shutdown_drain());
+                    shutdown_deadline =
+                        Some(Instant::now() + shutdown_drain(&self.config.env_prefix));
                 }
                 ServerEvent::ParentGone => break,
                 ServerEvent::Completed(response) => {
@@ -176,6 +316,18 @@ impl McpServer {
             }
         }
         0
+    }
+
+    /// Handle one JSON-RPC frame, routing tool calls through `owner` when
+    /// present, with the full fail-closed mutation recovery. Exposed for
+    /// app-level owner-recovery tests and custom transports; `run_stdio` uses
+    /// exactly this path.
+    pub fn handle_line_with_owner(
+        &self,
+        line: &str,
+        owner: Option<&OwnerEndpoint>,
+    ) -> Option<String> {
+        self.handle_line_maybe_remote(line, owner)
     }
 
     /// Handle one JSON-RPC frame in-process. This is what a resident owner should
@@ -197,9 +349,8 @@ impl McpServer {
         let method = match message.get("method").and_then(Value::as_str) {
             Some(method) => method,
             None => {
-                return is_request.then(|| {
-                    error_frame(id, INVALID_REQUEST, "Invalid Request: missing method")
-                })
+                return is_request
+                    .then(|| error_frame(id, INVALID_REQUEST, "Invalid Request: missing method"))
             }
         };
 
@@ -209,9 +360,8 @@ impl McpServer {
             "tools/call" => Some(self.tools_call(id, &message)),
             "ping" => Some(result_frame(id, json!({}))),
             _ if method.starts_with("notifications/") => None,
-            _ => is_request.then(|| {
-                error_frame(id, METHOD_NOT_FOUND, &format!("Method not found: {method}"))
-            }),
+            _ => is_request
+                .then(|| error_frame(id, METHOD_NOT_FOUND, &format!("Method not found: {method}"))),
         }
     }
 
@@ -227,40 +377,58 @@ impl McpServer {
             return self.handle_line(line);
         };
 
+        let prose = &self.config.owner_prose;
         match sidecar::send_line(owner, line) {
             Ok(response) => response,
+            // The resident owner is unreachable. A mutation must NEVER fall back to
+            // an in-process write while a *live* owner exists (the second-writer
+            // hole). But a *dead* owner must not wedge every write forever, and we
+            // must never claim a recovery that did not happen. So re-elect: only
+            // when the owner is truly gone is the stale registration cleared and a
+            // fresh resident writer spawned, then the write is retried once. If
+            // re-election or the retry fails, refuse with an honest, actionable
+            // remedy — never a false "restarts automatically".
             Err(_) if self.line_calls_mutating_tool(line) => {
                 match sidecar::recover_owner(sidecar_config, owner) {
                     OwnerRecovery::Reelected(fresh) => match sidecar::send_line(&fresh, line) {
                         Ok(response) => response,
                         Err(error) => Some(error_frame(
                             request_id(line),
-                            OWNER_SERVICE_UNAVAILABLE,
-                            &format!(
-                                "resident owner unavailable — mutation refused; no changes were made. \
-                                 A fresh owner was elected but could not be reached ({error}). \
-                                 Restart the app owner process and retry."
-                            ),
+                            prose.code,
+                            &prose.reelected_unreachable(&error),
                         )),
                     },
                     OwnerRecovery::LiveButUnreachable => Some(error_frame(
                         request_id(line),
-                        OWNER_SERVICE_UNAVAILABLE,
-                        "resident owner unavailable — mutation refused; no changes were made. \
-                         The owner process is still alive but did not respond in time. Retry in a moment.",
+                        prose.code,
+                        &prose.live_but_unreachable(),
                     )),
                     OwnerRecovery::Down(error) => Some(error_frame(
                         request_id(line),
-                        OWNER_SERVICE_UNAVAILABLE,
-                        &format!(
-                            "resident owner unavailable — mutation refused; no changes were made. \
-                             The owner process is down and could not be re-elected ({error}). \
-                             Restart the app owner process and retry."
-                        ),
+                        prose.code,
+                        &prose.down(&error),
                     )),
                 }
             }
-            Err(error) => annotate_read_owner_unreachable(self.handle_line(line), &error),
+            // A read MAY degrade gracefully: fall through to an in-process read,
+            // which cannot corrupt state — orientation still works when the owner
+            // is momentarily unreachable, while writes stay strictly fail-closed.
+            // The degraded read is annotated so the agent sees the transport fact.
+            Err(error) => {
+                let annotate = match &self.config.annotate_degraded_reads {
+                    None => true,
+                    Some(tools) => tools.iter().any(|tool| line_calls_tool_named(line, tool)),
+                };
+                if annotate {
+                    annotate_read_owner_unreachable(
+                        self.handle_line(line),
+                        &error,
+                        &self.config.read_annotation_source,
+                    )
+                } else {
+                    self.handle_line(line)
+                }
+            }
         }
     }
 
@@ -357,7 +525,27 @@ fn line_calls_tool(line: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn annotate_read_owner_unreachable(response: Option<String>, error: &str) -> Option<String> {
+fn line_calls_tool_named(line: &str, expected: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|message| {
+            if message.get("method").and_then(Value::as_str) != Some("tools/call") {
+                return None;
+            }
+            message
+                .get("params")
+                .and_then(|params| params.get("name"))
+                .and_then(Value::as_str)
+                .map(|name| name == expected)
+        })
+        .unwrap_or(false)
+}
+
+fn annotate_read_owner_unreachable(
+    response: Option<String>,
+    error: &str,
+    source: &str,
+) -> Option<String> {
     let raw = response?;
     let Ok(mut frame) = serde_json::from_str::<Value>(&raw) else {
         return Some(raw);
@@ -374,7 +562,7 @@ fn annotate_read_owner_unreachable(response: Option<String>, error: &str) -> Opt
         "mcp_owner".to_string(),
         json!({
             "state": "unreachable",
-            "source": "turnkey_mcp_sidecar",
+            "source": source,
             "error": error,
             "write_behavior": "fail_closed_or_reattach",
             "system_action": "next_mutation_recovers_if_owner_is_dead"
@@ -420,15 +608,25 @@ fn attach_mutation_warning(value: &mut Value, warning: String) {
     }
 }
 
+/// Runtime events of the stdio loop. `#[doc(hidden)]`-public so apps porting
+/// their MCP regression suites can drive `Dispatch` directly and assert on the
+/// completions it emits; not part of the stability contract.
+#[doc(hidden)]
 #[derive(Debug)]
-enum ServerEvent {
+pub enum ServerEvent {
     Line(String),
     InputClosed,
     ParentGone,
     Completed(Option<String>),
 }
 
-struct Dispatch {
+/// Routes each request to the path that keeps the control surface correct:
+/// mutating tool calls go to a single ordered worker so they execute in strict
+/// arrival order and pipelined dependent mutations can never reorder; read-only
+/// calls are spawned concurrently so a slow mutation never wedges reads.
+/// `#[doc(hidden)]`-public for app regression suites.
+#[doc(hidden)]
+pub struct Dispatch {
     server: McpServer,
     events_tx: mpsc::Sender<ServerEvent>,
     mutations_tx: mpsc::Sender<String>,
@@ -436,7 +634,7 @@ struct Dispatch {
 }
 
 impl Dispatch {
-    fn new(
+    pub fn new(
         server: McpServer,
         events_tx: mpsc::Sender<ServerEvent>,
         owner: Option<OwnerEndpoint>,
@@ -459,7 +657,7 @@ impl Dispatch {
         }
     }
 
-    fn dispatch(&self, line: String) {
+    pub fn dispatch(&self, line: String) {
         if self.server.line_calls_mutating_tool(&line) {
             let _ = self.mutations_tx.send(line);
         } else {
@@ -491,8 +689,9 @@ fn spawn_stdin_reader(tx: mpsc::Sender<ServerEvent>) {
     });
 }
 
-fn shutdown_drain() -> Duration {
-    std::env::var("TURNKEY_MCP_SHUTDOWN_DRAIN_MS")
+#[doc(hidden)]
+pub fn shutdown_drain(env_prefix: &str) -> Duration {
+    std::env::var(format!("{env_prefix}_MCP_SHUTDOWN_DRAIN_MS"))
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|millis| *millis > 0)
@@ -501,8 +700,8 @@ fn shutdown_drain() -> Duration {
 }
 
 #[cfg(unix)]
-fn parent_watchdog_interval() -> Duration {
-    std::env::var("TURNKEY_MCP_PARENT_WATCHDOG_MS")
+fn parent_watchdog_interval(env_prefix: &str) -> Duration {
+    std::env::var(format!("{env_prefix}_MCP_PARENT_WATCHDOG_MS"))
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|millis| *millis > 0)
@@ -526,24 +725,26 @@ fn arm_parent_death_signal() {
 fn arm_parent_death_signal() {}
 
 #[cfg(unix)]
-fn parent_disappeared(original_parent: libc::pid_t, current_parent: libc::pid_t) -> bool {
+#[doc(hidden)]
+pub fn parent_disappeared(original_parent: libc::pid_t, current_parent: libc::pid_t) -> bool {
     current_parent <= 1 || current_parent != original_parent
 }
 
 #[cfg(unix)]
-fn spawn_parent_watchdog(tx: mpsc::Sender<ServerEvent>) {
+fn spawn_parent_watchdog(env_prefix: &str, tx: mpsc::Sender<ServerEvent>) {
     let original_parent = current_parent_pid();
     arm_parent_death_signal();
     spawn_parent_watchdog_with(
         tx,
-        parent_watchdog_interval(),
+        parent_watchdog_interval(env_prefix),
         original_parent,
         current_parent_pid,
     );
 }
 
 #[cfg(unix)]
-fn spawn_parent_watchdog_with(
+#[doc(hidden)]
+pub fn spawn_parent_watchdog_with(
     tx: mpsc::Sender<ServerEvent>,
     interval: Duration,
     original_parent: libc::pid_t,
@@ -559,7 +760,7 @@ fn spawn_parent_watchdog_with(
 }
 
 #[cfg(windows)]
-fn spawn_parent_watchdog(tx: mpsc::Sender<ServerEvent>) {
+fn spawn_parent_watchdog(_env_prefix: &str, tx: mpsc::Sender<ServerEvent>) {
     let Some(parent_pid) = windows_parent_pid() else {
         return;
     };
@@ -613,7 +814,7 @@ fn windows_parent_pid() -> Option<u32> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn spawn_parent_watchdog(_tx: mpsc::Sender<ServerEvent>) {}
+fn spawn_parent_watchdog(_env_prefix: &str, _tx: mpsc::Sender<ServerEvent>) {}
 
 #[cfg(test)]
 mod tests {
@@ -639,7 +840,10 @@ mod tests {
         let init: Value = serde_json::from_str(&init).unwrap();
         assert_eq!(init["result"]["protocolVersion"], "2024-11-05");
         assert_eq!(init["result"]["serverInfo"]["name"], "todo");
-        assert!(init["result"]["instructions"].as_str().unwrap().contains("todo_"));
+        assert!(init["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("todo_"));
 
         let tools = server
             .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
@@ -650,14 +854,12 @@ mod tests {
 
     #[test]
     fn tool_call_returns_structured_content() {
-        let server = McpServer::new(ServerConfig::new("todo", "0.1.0", ".").tool(
-            ToolSpec::read(
-                "todo_status",
-                "Return status",
-                json!({ "type": "object", "properties": {} }),
-                |_ctx, _args| Ok(json!({ "ok": true })),
-            ),
-        ));
+        let server = McpServer::new(ServerConfig::new("todo", "0.1.0", ".").tool(ToolSpec::read(
+            "todo_status",
+            "Return status",
+            json!({ "type": "object", "properties": {} }),
+            |_ctx, _args| Ok(json!({ "ok": true })),
+        )));
         let raw = server
             .handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"todo_status","arguments":{}}}"#)
             .unwrap();
@@ -668,14 +870,14 @@ mod tests {
 
     #[test]
     fn mutating_tool_is_serialized_by_dispatch() {
-        let server = McpServer::new(ServerConfig::new("todo", "0.1.0", ".").tool(
-            ToolSpec::write(
+        let server = McpServer::new(
+            ServerConfig::new("todo", "0.1.0", ".").tool(ToolSpec::write(
                 "todo_create",
                 "Create",
                 json!({ "type": "object", "properties": {} }),
                 |_ctx, _args| Ok(json!({ "created": true })),
-            ),
-        ));
+            )),
+        );
         assert!(server.line_calls_mutating_tool(
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"todo_create","arguments":{}}}"#
         ));
