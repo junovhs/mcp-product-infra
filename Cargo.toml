@@ -1,6 +1,6 @@
 [package]
 name = "turnkey-mcp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "Turnkey MCP for apps: stdio protocol, typed tools, host setup, sidecar lifecycle, and manifest-friendly integration."
@@ -21,8 +21,10 @@ libc = "0.2"
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_Storage_FileSystem",
+  "Win32_System_Console",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_IO",
+  "Win32_System_Pipes",
   "Win32_System_Threading"
 ] }
 

@@ -35,8 +35,13 @@ Hard-won behaviors carried over from production incidents, at parity with curren
 - stdio MCP JSON-RPC server loop
 - typed tool registry
 - `initialize`, `tools/list`, `tools/call`, `ping`, and notification handling
+- optional MCP resources (`resources/list` / `resources/read`) from an app-supplied closed set
+- `tools/list` annotations: `readOnlyHint` derived from each tool's read/write classification, per-tool overrides for the rest
 - structured MCP responses with text fallback plus `structuredContent`
 - read/write dispatch: read tools can run concurrently, mutating tools serialize in arrival order
+- panic containment: a panicking handler answers with a JSON-RPC internal error instead of hanging the request or killing the mutation worker
+- `before_tool` pre-dispatch hook (per-call readiness/freshness gates that can short-circuit a call)
+- in-process stdout capture (`capture::capture_stdout`) so print-first CLI core fns can serve as tool handlers without a rewrite
 - optional resident sidecar owner for app state that needs a single writer
 - crash-safe owner election through a lock file
 - stale owner retirement after rebuilds/reinstalls
@@ -280,6 +285,56 @@ ToolSpec::dynamic(
     handler,
 )
 ```
+
+## Resources, annotations, and pre-dispatch gates
+
+Serve app artifacts as MCP resources (a **closed set** — `resources/read` only
+serves a URI the provider enumerated, never an arbitrary path):
+
+```rust
+use turnkey_mcp::{ResourceContent, ResourceEntry};
+
+let config = config.resources(|ctx| {
+    let map = ctx.workspace_root.join("MAP.md");
+    let mut entries = Vec::new();
+    if map.is_file() {
+        entries.push(ResourceEntry::file(map, "MAP.md", "The rendered map.", "text/markdown"));
+    }
+    entries
+});
+```
+
+`tools/list` always advertises annotations: `readOnlyHint` is derived from the
+tool's dispatch classification (`ToolSpec::read` → `true`), and
+`ToolSpec::with_annotations(json!({ "destructiveHint": true }))` merges
+anything the classification cannot know. Note a `ToolSpec::dynamic` tool
+advertises `readOnlyHint: false` — a static host hint cannot depend on the
+call's arguments — so register a never-mutating tool with `ToolSpec::read`.
+
+Gate every call on app readiness with `before_tool` (e.g. semmap-style
+index freshness: refresh before any navigation tool answers, fail the call
+loudly when the refresh fails):
+
+```rust
+let config = config.before_tool(|ctx, name, _args| {
+    if name == "myapp_generate" {
+        return Ok(()); // the tool that produces the index is exempt
+    }
+    refresh_index(&ctx.workspace_root)
+        .map_err(|e| turnkey_mcp::ToolError::server(format!("auto-refresh failed: {e}")))
+});
+```
+
+## Print-first CLIs: stdout capture
+
+If your core fns print their result instead of returning a typed value,
+`capture::capture_stdout(cwd, f)` runs `f` with the process-global stdout
+redirected into a pipe (unix `dup2`, windows `SetStdHandle`), the working
+directory set to `cwd`, a draining thread against pipe-buffer deadlock, and a
+panic-safe restore. Calls are serialized by an internal global lock. This is
+how a CLI's exact output becomes a tool's text content without rewriting every
+command. Caveat: the redirect cannot be observed under `cargo test`'s output
+capture — test it by spawning your real binary.
 
 ## Host setup
 

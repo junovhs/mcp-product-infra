@@ -6,10 +6,21 @@ pub const PARSE_ERROR: i64 = -32700;
 pub const INVALID_REQUEST: i64 = -32600;
 pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
+pub const INTERNAL_ERROR: i64 = -32603;
 pub const SERVER_ERROR: i64 = -32000;
 /// Generic counterpart to Ishoo's STOR-22 `STORE_SERVICE_UNAVAILABLE` code.
 /// Returned when a mutating tool call cannot safely reach the resident owner.
 pub const OWNER_SERVICE_UNAVAILABLE: i64 = -32010;
+
+/// Best-effort human text from a caught panic payload (`&str` or `String`
+/// payloads; anything else reads "unknown panic").
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
 
 /// Context passed to every tool handler.
 #[derive(Clone, Debug)]
@@ -81,9 +92,22 @@ pub struct ToolSpec {
     pub input_schema: Value,
     pub mutation: MutationKind,
     pub handler: Handler,
+    /// Extra `tools/list` annotation members merged over the derived set
+    /// (override keys win). `readOnlyHint` is always derived from `mutation`
+    /// (`Never` → true), so most tools never set this; use it for hints the
+    /// dispatch classification cannot know, e.g. `destructiveHint`,
+    /// `idempotentHint`, `openWorldHint`, or a display `title`.
+    pub annotations: Option<Value>,
 }
 
 impl ToolSpec {
+    /// Merge extra `tools/list` annotation members over the derived set
+    /// (override keys win). See the `annotations` field.
+    pub fn with_annotations(mut self, annotations: Value) -> Self {
+        self.annotations = Some(annotations);
+        self
+    }
+
     pub fn read(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -96,6 +120,7 @@ impl ToolSpec {
             input_schema,
             mutation: MutationKind::Never,
             handler: Arc::new(handler),
+            annotations: None,
         }
     }
 
@@ -111,6 +136,7 @@ impl ToolSpec {
             input_schema,
             mutation: MutationKind::Always,
             handler: Arc::new(handler),
+            annotations: None,
         }
     }
 
@@ -127,6 +153,7 @@ impl ToolSpec {
             input_schema,
             mutation: MutationKind::Dynamic(Arc::new(mutates)),
             handler: Arc::new(handler),
+            annotations: None,
         }
     }
 }

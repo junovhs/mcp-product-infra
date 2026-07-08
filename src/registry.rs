@@ -54,11 +54,29 @@ impl ToolRegistry {
                     "name": tool.name,
                     "description": tool.description,
                     "inputSchema": tool.input_schema,
+                    "annotations": tool_annotations(tool),
                 })
             })
             .collect();
         json!({ "tools": tools })
     }
+}
+
+/// MCP `tools/list` annotations for one tool: `readOnlyHint` derived from the
+/// dispatch classification (`MutationKind::Never` → read-only; `Always` and
+/// `Dynamic` advertise non-read-only, since a host hint cannot depend on the
+/// arguments), then any `ToolSpec::annotations` overrides merged on top
+/// (override keys win, including `readOnlyHint`).
+fn tool_annotations(tool: &ToolSpec) -> Value {
+    let read_only = matches!(tool.mutation, crate::types::MutationKind::Never);
+    let mut annotations = serde_json::Map::new();
+    annotations.insert("readOnlyHint".to_string(), Value::Bool(read_only));
+    if let Some(Value::Object(overrides)) = &tool.annotations {
+        for (key, value) in overrides {
+            annotations.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(annotations)
 }
 
 /// Helper for op-dispatched tools. Reads `op`, strips it from the inner args, and

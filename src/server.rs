@@ -13,8 +13,8 @@ use crate::registry::ToolRegistry;
 use crate::response::{error_frame, result_frame, tool_ok};
 use crate::sidecar::{self, OwnerEndpoint, OwnerRecovery, SidecarConfig};
 use crate::types::{
-    ToolContext, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, OWNER_SERVICE_UNAVAILABLE,
-    PARSE_ERROR,
+    ToolContext, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
+    OWNER_SERVICE_UNAVAILABLE, PARSE_ERROR,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -29,6 +29,18 @@ const DEFAULT_PARENT_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 
 pub type MutationHook =
     Arc<dyn Fn(&ToolContext, &str, &mut Value) -> Result<(), String> + Send + Sync + 'static>;
+
+/// Pre-dispatch hook run before every known tool's handler: `(ctx, tool_name,
+/// args)`. Returning `Err` short-circuits the call with that error and the
+/// handler never runs — the generalization of a per-call readiness/freshness
+/// gate (e.g. "refresh the index before any navigation tool answers"). The hook
+/// filters by tool name itself; return `Ok(())` for tools it doesn't care about.
+pub type BeforeToolHook = Arc<
+    dyn Fn(&ToolContext, &str, &Value) -> Result<(), crate::types::ToolError>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// The prose (and JSON-RPC code) of the fail-closed owner-unavailable errors,
 /// so an app's agents see the app's own vocabulary ("store service", "resident
@@ -92,6 +104,11 @@ pub struct ServerConfig {
     pub context: ToolContext,
     pub registry: ToolRegistry,
     pub mutation_hook: Option<MutationHook>,
+    pub before_tool: Option<BeforeToolHook>,
+    /// When present, the server answers `resources/list` and `resources/read`
+    /// from this provider's enumerated set and advertises the `resources`
+    /// capability. When absent both methods stay method-not-found.
+    pub resources: Option<crate::resources::ResourceProvider>,
     /// When present, the stdio MCP process routes tool calls through the resident
     /// owner just like Ishoo. The owner process itself should build its
     /// `McpServer` without this field set, then pass `server.handle_line` to
@@ -134,6 +151,8 @@ impl ServerConfig {
             instructions: None,
             registry: ToolRegistry::new(),
             mutation_hook: None,
+            before_tool: None,
+            resources: None,
             sidecar: None,
             sidecar_required: true,
             owner_prose: OwnerProse::default(),
@@ -157,6 +176,30 @@ impl ServerConfig {
         hook: impl Fn(&ToolContext, &str, &mut Value) -> Result<(), String> + Send + Sync + 'static,
     ) -> Self {
         self.mutation_hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Serve `resources/list`/`resources/read` from this provider's enumerated
+    /// set (a closed set — no arbitrary-path reads) and advertise the
+    /// `resources` capability.
+    pub fn resources(
+        mut self,
+        provider: impl Fn(&ToolContext) -> Vec<crate::resources::ResourceEntry> + Send + Sync + 'static,
+    ) -> Self {
+        self.resources = Some(Arc::new(provider));
+        self
+    }
+
+    /// Run a hook before every known tool's handler; an `Err` short-circuits
+    /// the call. See [`BeforeToolHook`].
+    pub fn before_tool(
+        mut self,
+        hook: impl Fn(&ToolContext, &str, &Value) -> Result<(), crate::types::ToolError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.before_tool = Some(Arc::new(hook));
         self
     }
 
@@ -358,6 +401,16 @@ impl McpServer {
             "initialize" => Some(result_frame(id, self.initialize_result(&message))),
             "tools/list" => Some(result_frame(id, self.config.registry.tools_list_result())),
             "tools/call" => Some(self.tools_call(id, &message)),
+            "resources/list" if self.config.resources.is_some() => {
+                let provider = self.config.resources.as_ref().expect("checked above");
+                Some(result_frame(
+                    id,
+                    crate::resources::list(provider, &self.config.context),
+                ))
+            }
+            "resources/read" if self.config.resources.is_some() => {
+                Some(self.resources_read(id, &message))
+            }
             "ping" => Some(result_frame(id, json!({}))),
             _ if method.starts_with("notifications/") => None,
             _ => is_request
@@ -432,6 +485,27 @@ impl McpServer {
         }
     }
 
+    /// Dispatch a `resources/read`: require a `uri` param and serve it from the
+    /// provider's enumerated set, mapping an unknown/unreadable uri to an
+    /// invalid-params error.
+    fn resources_read(&self, id: Value, message: &Value) -> String {
+        let Some(provider) = self.config.resources.as_ref() else {
+            return error_frame(id, METHOD_NOT_FOUND, "Method not found: resources/read");
+        };
+        let uri = message
+            .get("params")
+            .and_then(|params| params.get("uri"))
+            .and_then(Value::as_str);
+        let uri = match uri {
+            Some(uri) if !uri.trim().is_empty() => uri,
+            _ => return error_frame(id, INVALID_PARAMS, "Missing resource uri in params"),
+        };
+        match crate::resources::read(provider, &self.config.context, uri) {
+            Ok(value) => result_frame(id, value),
+            Err(message) => error_frame(id, INVALID_PARAMS, &message),
+        }
+    }
+
     fn initialize_result(&self, message: &Value) -> Value {
         let protocol_version = message
             .get("params")
@@ -439,9 +513,13 @@ impl McpServer {
             .and_then(Value::as_str)
             .unwrap_or(DEFAULT_PROTOCOL_VERSION);
 
+        let mut capabilities = json!({ "tools": {} });
+        if self.config.resources.is_some() {
+            capabilities["resources"] = json!({});
+        }
         let mut result = json!({
             "protocolVersion": protocol_version,
-            "capabilities": { "tools": {} },
+            "capabilities": capabilities,
             "serverInfo": {
                 "name": self.config.app_name.clone(),
                 "version": self.config.version.clone(),
@@ -468,7 +546,29 @@ impl McpServer {
             .cloned()
             .unwrap_or_else(|| json!({}));
 
-        match (tool.handler)(&self.config.context, &args) {
+        // A panic in a handler must not take down the long-running server (or,
+        // worse, silently kill the FIFO mutation worker). Contain it here and
+        // surface it as a JSON-RPC internal error naming the tool.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(hook) = &self.config.before_tool {
+                hook(&self.config.context, name, &args)?;
+            }
+            (tool.handler)(&self.config.context, &args)
+        }));
+        let handled = match outcome {
+            Ok(handled) => handled,
+            Err(payload) => {
+                return error_frame(
+                    id,
+                    INTERNAL_ERROR,
+                    &format!(
+                        "Tool '{name}' panicked while executing: {}",
+                        crate::types::panic_message(payload.as_ref())
+                    ),
+                )
+            }
+        };
+        match handled {
             Ok(mut value) => {
                 if tool.mutation.mutates(&args) {
                     if let Some(hook) = &self.config.mutation_hook {
@@ -645,7 +745,7 @@ impl Dispatch {
         let worker_owner = owner.clone();
         thread::spawn(move || {
             for line in mutations_rx {
-                let response = worker_server.handle_line_maybe_remote(&line, worker_owner.as_ref());
+                let response = handle_line_contained(&worker_server, &line, worker_owner.as_ref());
                 let _ = worker_events.send(ServerEvent::Completed(response));
             }
         });
@@ -665,11 +765,37 @@ impl Dispatch {
             let tx = self.events_tx.clone();
             let owner = self.owner.clone();
             thread::spawn(move || {
-                let response = server.handle_line_maybe_remote(&line, owner.as_ref());
+                let response = handle_line_contained(&server, &line, owner.as_ref());
                 let _ = tx.send(ServerEvent::Completed(response));
             });
         }
     }
+}
+
+/// Handle a frame on a dispatch thread with a panic backstop. `tools_call`
+/// already contains handler panics; this outer layer guards everything else on
+/// the request path, because a panic that escaped a dispatch thread would drop
+/// the request without a response (the client hangs) and leak the in-flight
+/// accounting — and on the mutation worker it would kill the FIFO loop, so
+/// every later mutation would be silently swallowed.
+fn handle_line_contained(
+    server: &McpServer,
+    line: &str,
+    owner: Option<&OwnerEndpoint>,
+) -> Option<String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        server.handle_line_maybe_remote(line, owner)
+    }))
+    .unwrap_or_else(|payload| {
+        Some(error_frame(
+            request_id(line),
+            INTERNAL_ERROR,
+            &format!(
+                "Internal error: request handling panicked: {}",
+                crate::types::panic_message(payload.as_ref())
+            ),
+        ))
+    })
 }
 
 fn spawn_stdin_reader(tx: mpsc::Sender<ServerEvent>) {
@@ -819,8 +945,252 @@ fn spawn_parent_watchdog(_env_prefix: &str, _tx: mpsc::Sender<ServerEvent>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ToolSpec;
+    use crate::types::{ToolSpec, INTERNAL_ERROR};
     use serde_json::json;
+
+    /// Run `f` with the default panic hook silenced, so tests that provoke an
+    /// intentional handler panic keep the output clean.
+    fn with_quiet_panics<T>(f: impl FnOnce() -> T) -> T {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let value = f();
+        std::panic::set_hook(previous);
+        value
+    }
+
+    fn panicking_server(mutating: bool) -> McpServer {
+        let boom = |_ctx: &ToolContext, _args: &Value| -> crate::types::ToolResult {
+            panic!("boom in handler")
+        };
+        let schema = json!({ "type": "object", "properties": {} });
+        let tool = if mutating {
+            ToolSpec::write("todo_boom", "Panic", schema, boom)
+        } else {
+            ToolSpec::read("todo_boom", "Panic", schema, boom)
+        };
+        McpServer::new(
+            ServerConfig::new("todo", "0.1.0", ".")
+                .tool(tool)
+                .tool(ToolSpec::write(
+                    "todo_create",
+                    "Create",
+                    json!({ "type": "object", "properties": {} }),
+                    |_ctx, _args| Ok(json!({ "created": true })),
+                )),
+        )
+    }
+
+    fn call_frame(id: u32, tool: &str) -> String {
+        json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": tool, "arguments": {} }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn panicking_tool_returns_internal_error_frame() {
+        let raw = with_quiet_panics(|| {
+            panicking_server(false)
+                .handle_line(&call_frame(7, "todo_boom"))
+                .unwrap()
+        });
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["error"]["code"], INTERNAL_ERROR);
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("todo_boom"), "names the tool: {message}");
+        assert!(
+            message.contains("boom in handler"),
+            "carries the panic message: {message}"
+        );
+    }
+
+    #[test]
+    fn panicking_read_still_completes_with_an_error_response() {
+        with_quiet_panics(|| {
+            let (tx, rx) = mpsc::channel();
+            let dispatch = Dispatch::new(panicking_server(false), tx, None);
+            dispatch.dispatch(call_frame(8, "todo_boom"));
+            let event = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a panicking read must still complete (else the request hangs forever)");
+            let ServerEvent::Completed(Some(raw)) = event else {
+                panic!("expected a completed response, got {event:?}");
+            };
+            let response: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(response["id"], 8);
+            assert_eq!(response["error"]["code"], INTERNAL_ERROR);
+        });
+    }
+
+    #[test]
+    fn panicking_mutation_does_not_kill_the_worker() {
+        with_quiet_panics(|| {
+            let (tx, rx) = mpsc::channel();
+            let dispatch = Dispatch::new(panicking_server(true), tx, None);
+            dispatch.dispatch(call_frame(9, "todo_boom"));
+            dispatch.dispatch(call_frame(10, "todo_create"));
+
+            let mut by_id = std::collections::BTreeMap::new();
+            for _ in 0..2 {
+                let event = rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("both mutations must complete; a panic must not kill the FIFO worker");
+                let ServerEvent::Completed(Some(raw)) = event else {
+                    panic!("expected a completed response, got {event:?}");
+                };
+                let response: Value = serde_json::from_str(&raw).unwrap();
+                by_id.insert(response["id"].as_u64().unwrap(), response);
+            }
+            assert_eq!(by_id[&9]["error"]["code"], INTERNAL_ERROR);
+            assert_eq!(by_id[&10]["result"]["structuredContent"]["created"], true);
+        });
+    }
+
+    #[test]
+    fn before_tool_hook_short_circuits_with_its_error() {
+        let server = McpServer::new(
+            ServerConfig::new("todo", "0.1.0", ".")
+                .tool(ToolSpec::read(
+                    "todo_status",
+                    "Return status",
+                    json!({ "type": "object", "properties": {} }),
+                    |_ctx, _args| Ok(json!({ "ok": true })),
+                ))
+                .before_tool(|_ctx, name, _args| {
+                    if name == "todo_status" {
+                        Err(crate::types::ToolError::new(-32050, "index is stale"))
+                    } else {
+                        Ok(())
+                    }
+                }),
+        );
+        let raw = server.handle_line(&call_frame(11, "todo_status")).unwrap();
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["error"]["code"], -32050);
+        assert_eq!(response["error"]["message"], "index is stale");
+    }
+
+    #[test]
+    fn before_tool_hook_passes_through_on_ok() {
+        let server = McpServer::new(
+            ServerConfig::new("todo", "0.1.0", ".")
+                .tool(ToolSpec::read(
+                    "todo_status",
+                    "Return status",
+                    json!({ "type": "object", "properties": {} }),
+                    |_ctx, _args| Ok(json!({ "ok": true })),
+                ))
+                .before_tool(|_ctx, _name, _args| Ok(())),
+        );
+        let raw = server.handle_line(&call_frame(12, "todo_status")).unwrap();
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["result"]["structuredContent"]["ok"], true);
+    }
+
+    #[test]
+    fn tools_list_annotations_derive_read_only_and_merge_overrides() {
+        let server = McpServer::new(
+            ServerConfig::new("todo", "0.1.0", ".")
+                .tool(ToolSpec::read(
+                    "todo_status",
+                    "Return status",
+                    json!({ "type": "object", "properties": {} }),
+                    |_ctx, _args| Ok(json!({ "ok": true })),
+                ))
+                .tool(
+                    ToolSpec::write(
+                        "todo_regen",
+                        "Regenerate",
+                        json!({ "type": "object", "properties": {} }),
+                        |_ctx, _args| Ok(json!({ "ok": true })),
+                    )
+                    .with_annotations(json!({ "destructiveHint": true })),
+                ),
+        );
+        let raw = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":13,"method":"tools/list"}"#)
+            .unwrap();
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        let tools = response["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["annotations"]["readOnlyHint"], true);
+        assert_eq!(tools[0]["annotations"].get("destructiveHint"), None);
+        assert_eq!(tools[1]["annotations"]["readOnlyHint"], false);
+        assert_eq!(tools[1]["annotations"]["destructiveHint"], true);
+    }
+
+    #[test]
+    fn resources_absent_stays_method_not_found_and_unadvertised() {
+        let server = McpServer::new(ServerConfig::new("todo", "0.1.0", "."));
+        let raw = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":14,"method":"resources/list"}"#)
+            .unwrap();
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["error"]["code"], METHOD_NOT_FOUND);
+
+        let raw = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":15,"method":"initialize","params":{}}"#)
+            .unwrap();
+        let init: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(init["result"]["capabilities"].get("resources"), None);
+    }
+
+    #[test]
+    fn resources_provider_serves_list_and_closed_set_read() {
+        let server = McpServer::new(ServerConfig::new("todo", "0.1.0", ".").resources(|_ctx| {
+            vec![crate::resources::ResourceEntry {
+                uri: "app://brief".to_string(),
+                name: "brief".to_string(),
+                description: "The protocol.".to_string(),
+                mime_type: "text/plain".to_string(),
+                content: crate::resources::ResourceContent::Inline("be excellent".to_string()),
+            }]
+        }));
+
+        let raw = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":16,"method":"initialize","params":{}}"#)
+            .unwrap();
+        let init: Value = serde_json::from_str(&raw).unwrap();
+        assert!(init["result"]["capabilities"]["resources"].is_object());
+
+        let raw = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":17,"method":"resources/list"}"#)
+            .unwrap();
+        let listed: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(listed["result"]["resources"][0]["uri"], "app://brief");
+
+        let raw = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":18,"method":"resources/read","params":{"uri":"app://brief"}}"#)
+            .unwrap();
+        let read: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(read["result"]["contents"][0]["text"], "be excellent");
+
+        let raw = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":19,"method":"resources/read","params":{"uri":"file:///etc/passwd"}}"#)
+            .unwrap();
+        let rejected: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(rejected["error"]["code"], INVALID_PARAMS);
+    }
+
+    #[test]
+    fn capture_recovers_from_a_panicking_command() {
+        with_quiet_panics(|| {
+            let panicked = crate::capture::capture_stdout(std::path::Path::new("."), || {
+                panic!("boom in command")
+            });
+            let (_text, result) = panicked.expect("capture machinery survives a panic");
+            let message = result.expect_err("panic surfaces as a command error");
+            assert!(message.contains("panicked"), "{message}");
+
+            // A subsequent capture still works — stdout was restored, the fd not
+            // leaked to the dead pipe.
+            let (_text2, result2) =
+                crate::capture::capture_stdout(std::path::Path::new("."), || Ok(()))
+                    .expect("second capture works");
+            assert!(result2.is_ok(), "capture works after a prior panic");
+        });
+    }
 
     #[test]
     fn initialize_echoes_protocol_and_lists_tools() {

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.0 - engineering mined from semmap's MCP
+
+Capabilities semmap's hand-rolled MCP server had that the crate lacked, now
+generalized here (semmap provenance: `src/mcp/{mod,capture,resources,registry}.rs`):
+
+- Panic containment: a panicking tool handler answers with a JSON-RPC internal
+  error naming the tool and panic message. Previously a read's panic killed its
+  dispatch thread before the completion event (the request hung forever and the
+  in-flight accounting leaked), and a mutation's panic killed the FIFO worker
+  (every later mutation was silently swallowed). A second backstop wraps the
+  dispatch threads themselves so a completion is always emitted.
+- MCP resources: `ServerConfig::resources(provider)` serves `resources/list` /
+  `resources/read` from an app-enumerated closed set (file-backed or inline;
+  no arbitrary-path reads) and advertises the `resources` capability. Absent a
+  provider both methods stay method-not-found, as before.
+- Tool annotations in `tools/list`: `readOnlyHint` derived from `MutationKind`
+  (`Never` → true), `ToolSpec::with_annotations` merges overrides
+  (`destructiveHint`, `idempotentHint`, `title`, ...) on top.
+- `ServerConfig::before_tool` pre-dispatch hook: runs before every known tool's
+  handler and can short-circuit the call with a `ToolError` — the general form
+  of semmap's per-call index-freshness gate.
+- `capture::capture_stdout`: in-process stdout capture (unix + windows) with
+  cwd handling, drain thread, and panic-safe fd restore, so print-first CLI
+  core fns can serve as tool handlers.
+- `types::INTERNAL_ERROR` (-32603) exported alongside the other JSON-RPC codes.
+
+
 ## 0.2.0 - parity with current Ishoo; Ishoo consumes the crate
 
 - Ishoo's MCP runtime now depends on this crate (Ishoo MCP-62): its local stdio

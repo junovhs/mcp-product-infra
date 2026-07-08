@@ -7,8 +7,10 @@
 //! optional sidecar ownership, and no-clobber host config installers.
 
 pub mod adapters;
+pub mod capture;
 pub mod manifest;
 pub mod registry;
+pub mod resources;
 pub mod response;
 pub mod server;
 pub mod sidecar;
@@ -21,7 +23,8 @@ pub use manifest::{
     HandlerCommand, HandlerRequest, HandlerResponse, Manifest, ManifestMutation, ManifestTool,
 };
 pub use registry::ToolRegistry;
+pub use resources::{ResourceContent, ResourceEntry, ResourceProvider};
 pub use response::{error_frame, result_frame, tool_ok};
-pub use server::{McpServer, OwnerProse, ServerConfig};
+pub use server::{BeforeToolHook, McpServer, MutationHook, OwnerProse, ServerConfig};
 pub use sidecar::{OwnerEndpoint, OwnerRecovery, SidecarConfig};
 pub use types::{MutationKind, ToolContext, ToolError, ToolResult, ToolSpec};
