@@ -496,9 +496,7 @@ impl McpServer {
             // FIX-169: the request left the client; the owner may already have
             // committed. Do NOT recover/re-send (that double-applies), and do NOT
             // claim "write refused". Tell the agent to verify before retrying.
-            Err(error)
-                if self.line_calls_mutating_tool(line) && error.may_have_committed() =>
-            {
+            Err(error) if self.line_calls_mutating_tool(line) && error.may_have_committed() => {
                 Some(error_frame(
                     request_id(line),
                     prose.code,
@@ -1392,6 +1390,58 @@ mod tests {
         assert!(parent_disappeared(42, 1));
     }
 
+    #[test]
+    fn live_but_unreachable_owner_refuses_mutation_without_local_write() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let applied = Arc::new(AtomicUsize::new(0));
+        let applied_h = applied.clone();
+        let sidecar =
+            SidecarConfig::new("todo", dir.path(), dir.path().join("cache")).app_version("0.1.0");
+        let unreachable = crate::sidecar::test_support::unreachable_endpoint(&sidecar);
+
+        let server = McpServer::new(
+            ServerConfig::new("todo", "0.1.0", dir.path())
+                .sidecar(sidecar)
+                .tool(ToolSpec::write(
+                    "todo_create",
+                    "Create",
+                    json!({ "type": "object", "properties": {} }),
+                    move |_ctx, _args| {
+                        applied_h.fetch_add(1, Ordering::SeqCst);
+                        Ok(json!({ "created": true }))
+                    },
+                )),
+        );
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/call",
+            "params": { "name": "todo_create", "arguments": {} }
+        })
+        .to_string();
+
+        let raw = server
+            .handle_line_with_owner(&request, Some(&unreachable))
+            .expect("must produce a fail-closed response frame");
+        let response: Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(response["id"], 41);
+        assert_eq!(response["error"]["code"], OWNER_SERVICE_UNAVAILABLE);
+        let message = response["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("mutation refused; no changes were made"),
+            "must be fail-closed: {message}"
+        );
+        assert_eq!(
+            applied.load(Ordering::SeqCst),
+            0,
+            "the in-process mutating handler must not run while a live owner is unreachable"
+        );
+    }
+
     /// FIX-169: after the owner applies a mutation, a lost response must not be
     /// reported as "write refused" and must not re-send the mutation.
     #[test]
@@ -1402,8 +1452,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let applied = Arc::new(AtomicUsize::new(0));
         let applied_h = applied.clone();
-        let sidecar = SidecarConfig::new("todo", dir.path(), dir.path().join("cache"))
-            .app_version("0.1.0");
+        let sidecar =
+            SidecarConfig::new("todo", dir.path(), dir.path().join("cache")).app_version("0.1.0");
         let owner = crate::sidecar::test_support::start_owner_thread_drop_response(
             sidecar.clone(),
             move |_line| {

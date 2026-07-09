@@ -389,10 +389,7 @@ pub enum OwnerTransportError {
 impl OwnerTransportError {
     /// True when the request left the client and a committed write is possible.
     pub fn may_have_committed(&self) -> bool {
-        matches!(
-            self,
-            Self::ResponseLost(_) | Self::MalformedResponse(_)
-        )
+        matches!(self, Self::ResponseLost(_) | Self::MalformedResponse(_))
     }
 
     pub fn message(&self) -> &str {
@@ -417,8 +414,8 @@ pub fn send_line(
     endpoint: &OwnerEndpoint,
     line: &str,
 ) -> Result<Option<String>, OwnerTransportError> {
-    let mut stream = TcpStream::connect_timeout(&endpoint.addr, Duration::from_secs(1))
-        .map_err(|e| {
+    let mut stream =
+        TcpStream::connect_timeout(&endpoint.addr, Duration::from_secs(1)).map_err(|e| {
             OwnerTransportError::Connect(format!("failed to connect to resident MCP owner: {e}"))
         })?;
     stream
@@ -438,11 +435,9 @@ pub fn send_line(
     serde_json::to_writer(&mut stream, &request).map_err(|e| {
         OwnerTransportError::Write(format!("failed to encode MCP owner request: {e}"))
     })?;
-    stream
-        .write_all(b"\n")
-        .map_err(|e| {
-            OwnerTransportError::Write(format!("failed to write MCP owner request: {e}"))
-        })?;
+    stream.write_all(b"\n").map_err(|e| {
+        OwnerTransportError::Write(format!("failed to write MCP owner request: {e}"))
+    })?;
     stream.flush().map_err(|e| {
         OwnerTransportError::Write(format!("failed to flush MCP owner request: {e}"))
     })?;
@@ -893,9 +888,10 @@ pub mod test_support {
             for stream in listener.incoming().flatten() {
                 let handler = handler.clone();
                 if drop_response {
-                    let _ = handle_owner_stream_drop_response(&config, &token, stream, move |line| {
-                        handler(line)
-                    });
+                    let _ =
+                        handle_owner_stream_drop_response(&config, &token, stream, move |line| {
+                            handler(line)
+                        });
                 } else {
                     let _ = handle_owner_stream(&config, &token, stream, move |line| handler(line));
                 }
@@ -922,7 +918,8 @@ pub mod test_support {
             .map_err(|e| format!("failed to read MCP owner request: {e}"))?;
         let request: OwnerRequest = serde_json::from_str(raw.trim_end())
             .map_err(|e| format!("malformed MCP owner request: {e}"))?;
-        if request.token == token && super::line_method(&request.line).as_deref() == Some("owner/shutdown")
+        if request.token == token
+            && super::line_method(&request.line).as_deref() == Some("owner/shutdown")
         {
             // Still honor shutdown; tests that drop replies are about tool calls.
             let _ = config;
@@ -999,6 +996,39 @@ mod tests {
         drop(first);
         let third = OwnerLock::try_acquire(&cfg).unwrap();
         assert!(third.is_some(), "a released lock is takeable again");
+    }
+
+    #[test]
+    fn second_owner_exits_before_init_or_endpoint_write() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let _first = OwnerLock::try_acquire(&cfg)
+            .unwrap()
+            .expect("first owner holds the singleton lock");
+        let init_calls = Arc::new(AtomicUsize::new(0));
+        let init_calls_h = init_calls.clone();
+
+        run_owner_server(
+            cfg.clone(),
+            move || {
+                init_calls_h.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            |_line| Some(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#.to_string()),
+        )
+        .expect("contending owner exits cleanly");
+
+        assert_eq!(
+            init_calls.load(Ordering::SeqCst),
+            0,
+            "a second owner must not run app startup writes"
+        );
+        assert!(
+            !cfg.endpoint_path().exists(),
+            "a second owner must not publish a rival endpoint"
+        );
     }
 
     #[test]
