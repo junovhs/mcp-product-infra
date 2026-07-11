@@ -539,25 +539,42 @@ impl McpServer {
                     )),
                 }
             }
-            // A read MAY degrade gracefully: fall through to an in-process read,
-            // which cannot corrupt state — orientation still works when the owner
-            // is momentarily unreachable, while writes stay strictly fail-closed.
-            // The degraded read is annotated so the agent sees the transport fact.
+            // A read MAY degrade gracefully, but first re-attach if the cached
+            // endpoint belongs to a dead owner that has already been replaced.
+            // Otherwise a long-lived stdio server would keep dialing its startup
+            // endpoint forever even though the registered replacement is healthy.
+            // `recover_owner` still refuses to create a rival while the old PID
+            // is alive, so this uses the same single-writer safety rule as the
+            // mutation recovery path.
             Err(error) => {
-                let annotate = match &self.config.annotate_degraded_reads {
-                    None => true,
-                    Some(tools) => tools.iter().any(|tool| line_calls_tool_named(line, tool)),
-                };
-                if annotate {
-                    annotate_read_owner_unreachable(
-                        self.handle_line(line),
-                        error.message(),
-                        &self.config.read_annotation_source,
-                    )
-                } else {
-                    self.handle_line(line)
+                if let OwnerRecovery::Reelected(fresh) =
+                    sidecar::recover_owner(sidecar_config, owner)
+                {
+                    match sidecar::send_line(&fresh, line) {
+                        Ok(response) => return response,
+                        Err(retry_error) => {
+                            return self.degraded_read_response(line, retry_error.message());
+                        }
+                    }
                 }
+                self.degraded_read_response(line, error.message())
             }
+        }
+    }
+
+    fn degraded_read_response(&self, line: &str, error: &str) -> Option<String> {
+        let annotate = match &self.config.annotate_degraded_reads {
+            None => true,
+            Some(tools) => tools.iter().any(|tool| line_calls_tool_named(line, tool)),
+        };
+        if annotate {
+            annotate_read_owner_unreachable(
+                self.handle_line(line),
+                error,
+                &self.config.read_annotation_source,
+            )
+        } else {
+            self.handle_line(line)
         }
     }
 
@@ -1365,6 +1382,52 @@ mod tests {
         let response: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(response["result"]["isError"], false);
         assert_eq!(response["result"]["structuredContent"]["ok"], true);
+    }
+
+    #[test]
+    fn read_reattaches_to_a_registered_replacement_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar =
+            SidecarConfig::new("todo", dir.path(), dir.path().join("cache")).app_version("0.1.0");
+        let replacement = crate::sidecar::test_support::start_owner_thread(
+            sidecar.clone(),
+            |_line| {
+                Some(
+                    r#"{"jsonrpc":"2.0","id":31,"result":{"structuredContent":{"owner":"replacement"}}}"#
+                        .to_string(),
+                )
+            },
+        )
+        .expect("replacement owner starts");
+        crate::sidecar::test_support::write_endpoint(&sidecar, &replacement);
+        let stale = crate::sidecar::test_support::unreachable_endpoint(&sidecar);
+
+        let server = McpServer::new(
+            ServerConfig::new("todo", "0.1.0", dir.path())
+                .sidecar(sidecar)
+                .tool(ToolSpec::read(
+                    "todo_status",
+                    "Return status",
+                    json!({ "type": "object", "properties": {} }),
+                    |_ctx, _args| Ok(json!({ "owner": "in-process" })),
+                )),
+        );
+        let request = call_frame(31, "todo_status");
+
+        let raw = server
+            .handle_line_with_owner(&request, Some(&stale))
+            .expect("replacement owner answers the read");
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            response["result"]["structuredContent"]["owner"],
+            "replacement"
+        );
+        assert!(
+            response["result"]["structuredContent"]
+                .get("mcp_owner")
+                .is_none(),
+            "a replacement owner must re-attach instead of degrading the read"
+        );
     }
 
     #[test]

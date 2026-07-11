@@ -51,3 +51,32 @@ Before removing Ishoo's local MCP code, verify all of these still hold:
 - live-but-unreachable owner does not spawn a rival writer
 - config installers never clobber foreign host config
 - repo-level broken config can shadow user/global readiness facts
+
+## 2026-07-10: stale owner endpoint recovery
+
+Fixed in `src/server.rs` and covered by
+`server::tests::read_reattaches_to_a_registered_replacement_owner`.
+
+### Failure shape
+
+`McpServer::run_stdio()` captures the resident-owner endpoint at startup. If
+that owner exits and a replacement publishes a healthy endpoint, mutations use
+`recover_owner` for their one request, but reads used to fall back in-process
+against the permanently stale startup endpoint. Long-lived MCP frontends then
+reported a false `mcp_owner: unreachable` state even while the replacement
+owner was serving and publishing normally.
+
+### Resolution
+
+After a read cannot reach its cached owner, `handle_line_maybe_remote` now
+calls the existing liveness-safe `recover_owner` routine. When it finds a
+healthy registered replacement, it retries the read through that owner. It
+still refuses to spawn a rival when the old PID is alive; only a failed
+re-attachment falls back to the existing annotated in-process read.
+
+### Integration handoff
+
+Ishoo consumes this crate through a local path dependency. Rebuild/reinstall
+Ishoo after this change, then restart its stdio MCP frontend (normally by
+restarting the host session) so the running frontend is replaced. The existing
+resident owner can remain the sole writer throughout that restart.
