@@ -14,6 +14,7 @@ pub mod registry;
 pub mod resources;
 pub mod response;
 pub mod server;
+pub mod shell_guard;
 pub mod sidecar;
 pub mod types;
 

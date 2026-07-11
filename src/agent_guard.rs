@@ -23,6 +23,13 @@ use std::io::Read;
 /// and surface stderr to the model.
 pub const BLOCK_EXIT_CODE: i32 = 2;
 
+/// Block exit code for the PATH-shim (argv) mode. Deliberately NOT 2: clap's
+/// usage-error exit code is 2, so a version-skewed binary that does not yet
+/// understand `--check-rg` would otherwise read as "block" and take rg away
+/// from the user. 86 is produced by nothing else in the binary, keeping the
+/// shim fail-open under any skew or crash.
+pub const SHIM_BLOCK_EXIT_CODE: i32 = 86;
+
 /// The explanation surfaced to the agent when a command is blocked. Written to
 /// teach the correction, not just refuse: the agent's very next attempt should
 /// be the right command.
@@ -75,6 +82,40 @@ pub fn evaluate_bash_command(command: &str) -> Option<&'static str> {
         Some(RG_REPLACE_BLOCK_MESSAGE)
     } else {
         None
+    }
+}
+
+/// Evaluate a real `rg` argv (already shell-split — the PATH-shim entry point,
+/// see [`crate::shell_guard`]). `Some(message)` means block.
+pub fn evaluate_rg_argv<S: AsRef<str>>(args: &[S]) -> Option<&'static str> {
+    for arg in args {
+        let arg = arg.as_ref();
+        if arg == "--" {
+            break;
+        }
+        if arg.starts_with("--") {
+            continue; // long flags incl. explicit --replace: deliberate
+        }
+        if arg.len() > 1
+            && arg.starts_with('-')
+            && !arg.contains(char::is_whitespace)
+            && bundle_engages_replace(arg)
+        {
+            return Some(RG_REPLACE_BLOCK_MESSAGE);
+        }
+    }
+    None
+}
+
+/// Argv-mode runner for the PATH shim: print the explanation and return
+/// [`SHIM_BLOCK_EXIT_CODE`] on a blocked argv, else 0.
+pub fn run_argv_check<S: AsRef<str>>(args: &[S]) -> i32 {
+    match evaluate_rg_argv(args) {
+        Some(message) => {
+            eprintln!("{message}");
+            SHIM_BLOCK_EXIT_CODE
+        }
+        None => 0,
     }
 }
 
@@ -256,6 +297,34 @@ mod tests {
                 "must allow: {cmd}"
             );
         }
+    }
+
+    #[test]
+    fn argv_mode_blocks_bundles_and_allows_clean_usage() {
+        for argv in [
+            vec!["-rn", "foo", "src/"],
+            vec!["-rln", "reinstall"],
+            vec!["-nr", "foo"],
+            vec!["-r", "n", "foo"],
+        ] {
+            assert!(evaluate_rg_argv(&argv).is_some(), "must block: {argv:?}");
+        }
+        for argv in [
+            vec!["-n", "foo", "src/"],
+            vec!["--replace", "X", "foo"],
+            vec!["-t", "rust", "foo"],
+            vec!["-trust", "foo"],
+            vec!["-e", "foo", "--", "-rfile"],
+            vec!["-n", "-r is replace", "doc.md"],
+        ] {
+            assert!(evaluate_rg_argv(&argv).is_none(), "must allow: {argv:?}");
+        }
+        assert_eq!(run_argv_check(&["-rn", "x"]), SHIM_BLOCK_EXIT_CODE);
+        assert_ne!(
+            SHIM_BLOCK_EXIT_CODE, 2,
+            "shim block code must never collide with clap's usage-error exit code"
+        );
+        assert_eq!(run_argv_check(&["-n", "x"]), 0);
     }
 
     #[test]
