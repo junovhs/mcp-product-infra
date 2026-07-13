@@ -37,6 +37,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// that is a cumulative handle leak in a long-lived owner (MCP-67).
 const OWNER_STREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default upper bound for a completed owner request to produce its response.
+/// This is deliberately independent of [`OWNER_STREAM_IO_TIMEOUT`]: the latter
+/// protects socket framing, while an app handler may legitimately run longer
+/// than 30 seconds. Apps with a different bounded-operation envelope can set a
+/// product-specific value through [`SidecarConfig::response_timeout`].
+const DEFAULT_OWNER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn default_owner_response_timeout_ms() -> u64 {
+    DEFAULT_OWNER_RESPONSE_TIMEOUT.as_millis() as u64
+}
+
 /// How long a retiring owner waits for in-flight connection threads to finish
 /// writing their responses before exiting. A committed mutation's ack must not
 /// be torn down with the process (MCP-67: "write may have committed", os error
@@ -56,6 +67,12 @@ pub struct OwnerEndpoint {
     /// on first contact.
     #[serde(default)]
     pub fingerprint: String,
+    /// How long clients wait after delivering a request for the owner handler
+    /// to return its response. Persisted with the endpoint so every client uses
+    /// the winning owner's product configuration. Old registrations receive the
+    /// safe default instead of retaining the former 30-second deadline.
+    #[serde(default = "default_owner_response_timeout_ms")]
+    pub response_timeout_ms: u64,
 }
 
 /// A hook the owner runs right before it exits (idle-reap or a shutdown
@@ -89,6 +106,10 @@ pub struct SidecarConfig {
     /// Env var name that overrides `idle_timeout` in milliseconds (used by
     /// behavior tests). `None` disables the override.
     pub idle_timeout_env: Option<String>,
+    /// Maximum handler execution time observed by an owner client. This is not
+    /// a socket framing timeout and therefore must exceed any legitimate
+    /// product operation that can run through the resident owner.
+    pub response_timeout: Duration,
     /// Drain hook run before an owner exit (idle-reap or shutdown request).
     pub drain: Option<DrainHook>,
 }
@@ -105,6 +126,7 @@ impl std::fmt::Debug for SidecarConfig {
             .field("liveness_path", &self.liveness_path)
             .field("idle_timeout", &self.idle_timeout)
             .field("idle_timeout_env", &self.idle_timeout_env)
+            .field("response_timeout", &self.response_timeout)
             .field("drain", &self.drain.as_ref().map(|_| "<hook>"))
             .finish()
     }
@@ -127,6 +149,7 @@ impl SidecarConfig {
             liveness_path: None,
             idle_timeout: Duration::from_secs(600),
             idle_timeout_env: None,
+            response_timeout: DEFAULT_OWNER_RESPONSE_TIMEOUT,
             drain: None,
         }
     }
@@ -158,6 +181,11 @@ impl SidecarConfig {
 
     pub fn idle_timeout_env(mut self, var: impl Into<String>) -> Self {
         self.idle_timeout_env = Some(var.into());
+        self
+    }
+
+    pub fn response_timeout(mut self, timeout: Duration) -> Self {
+        self.response_timeout = timeout;
         self
     }
 
@@ -333,6 +361,7 @@ pub fn run_owner_server(
         token: new_token(),
         pid: std::process::id(),
         fingerprint: current_build_fingerprint(&config),
+        response_timeout_ms: config.response_timeout.as_millis() as u64,
     };
     write_endpoint(&config, &endpoint)?;
     // Only the lock holder ever reaches here, so it is the sole author of the
@@ -492,7 +521,9 @@ pub fn send_line(
             OwnerTransportError::Connect(format!("failed to connect to resident MCP owner: {e}"))
         })?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(Duration::from_millis(
+            endpoint.response_timeout_ms.max(1),
+        )))
         .map_err(|e| {
             OwnerTransportError::Write(format!("failed to set MCP owner read timeout: {e}"))
         })?;
@@ -922,6 +953,7 @@ pub mod test_support {
             token: new_token(),
             pid: std::process::id(),
             fingerprint: current_build_fingerprint(config),
+            response_timeout_ms: config.response_timeout.as_millis() as u64,
         }
     }
 
@@ -964,6 +996,7 @@ pub mod test_support {
             token: new_token(),
             pid: std::process::id(),
             fingerprint: current_build_fingerprint(&config),
+            response_timeout_ms: config.response_timeout.as_millis() as u64,
         };
         let token = endpoint.token.clone();
         let handler = Arc::new(handler);
@@ -1279,6 +1312,11 @@ mod tests {
             ep.fingerprint.is_empty(),
             "a legacy registration carries no fingerprint"
         );
+        assert_eq!(
+            ep.response_timeout_ms,
+            default_owner_response_timeout_ms(),
+            "a legacy registration receives the safe response deadline"
+        );
         assert_ne!(
             ep.fingerprint,
             current_build_fingerprint(&config(dir.path())),
@@ -1297,10 +1335,29 @@ mod tests {
             token: "t".to_string(),
             pid: std::process::id(),
             fingerprint: current_build_fingerprint(&cfg),
+            response_timeout_ms: cfg.response_timeout.as_millis() as u64,
         };
         write_endpoint(&cfg, &ep).unwrap();
         let read = read_endpoint(&cfg).expect("registration read back");
         assert_eq!(read.fingerprint, current_build_fingerprint(&cfg));
+        assert_eq!(read.response_timeout_ms, ep.response_timeout_ms);
+    }
+
+    #[test]
+    fn configured_response_timeout_is_published_and_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path()).response_timeout(Duration::from_millis(250));
+        let owner = test_support::start_owner_thread(cfg, |_line| {
+            thread::sleep(Duration::from_millis(75));
+            Some(r#"{"jsonrpc":"2.0","id":0,"result":{"slow":true}}"#.to_string())
+        })
+        .unwrap();
+
+        assert_eq!(owner.response_timeout_ms, 250);
+        let response = send_line(&owner, r#"{"jsonrpc":"2.0","id":0,"method":"slow/read"}"#)
+            .expect("handler completed within the configured response deadline")
+            .expect("slow handler returned a response");
+        assert!(response.contains(r#""slow":true"#));
     }
 
     #[cfg(target_os = "linux")]
