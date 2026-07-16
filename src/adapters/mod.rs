@@ -953,7 +953,9 @@ fn merge_claude_hooks(
         ));
     };
     for hook in hooks {
-        let event = hooks_root.entry(hook.event.clone()).or_insert_with(|| json!([]));
+        let event = hooks_root
+            .entry(hook.event.clone())
+            .or_insert_with(|| json!([]));
         let Some(groups) = event.as_array_mut() else {
             return Err(Materialized::Skipped(format!(
                 "Claude `hooks.{}` is not an array",

@@ -142,8 +142,7 @@ pub fn ensure_windows_rg_shim(
 pub fn remove_rg_shim(shim_dir: &Path) -> Result<(), String> {
     let path = shim_dir.join("rg");
     if path.exists() {
-        fs::remove_file(&path)
-            .map_err(|e| format!("failed to remove {}: {e}", path.display()))?;
+        fs::remove_file(&path).map_err(|e| format!("failed to remove {}: {e}", path.display()))?;
     }
     if fs::read_dir(shim_dir).is_ok_and(|mut d| d.next().is_none()) {
         let _ = fs::remove_dir(shim_dir);
@@ -294,11 +293,18 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o755);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
         }
         let before = fs::read(&path).unwrap();
         ensure_rg_shim(&shim_dir, "todo", "/opt/todo/bin/todo").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), before, "second run is byte-identical");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "second run is byte-identical"
+        );
 
         remove_rg_shim(&shim_dir).unwrap();
         assert!(!path.exists());
@@ -392,7 +398,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rc = dir.path().join("profile");
         ensure_rc_path_block(&rc, "todo", Path::new("/s")).unwrap();
-        assert!(fs::read_to_string(&rc).unwrap().starts_with("# >>> todo shell-guard >>>"));
+        assert!(fs::read_to_string(&rc)
+            .unwrap()
+            .starts_with("# >>> todo shell-guard >>>"));
 
         let missing = dir.path().join("nope");
         remove_rc_path_block(&missing, "todo").unwrap();
