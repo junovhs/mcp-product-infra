@@ -458,6 +458,11 @@ impl McpServer {
         };
 
         match method {
+            // FIX-02: a frame with no `id` key is a JSON-RPC notification — it
+            // must never receive a response, and a notification-shaped
+            // tools/call must never execute a tool. (An explicit `id: null`
+            // still counts as request-shaped; that handling is unchanged.)
+            _ if !is_request => None,
             "initialize" => Some(result_frame(id, self.initialize_result(&message))),
             "tools/list" => Some(result_frame(id, self.config.registry.tools_list_result())),
             "tools/call" => Some(self.tools_call(id, &message)),
@@ -483,7 +488,11 @@ impl McpServer {
         line: &str,
         owner: Option<&OwnerEndpoint>,
     ) -> Option<String> {
-        let Some(owner) = owner.filter(|_| line_calls_tool(line)) else {
+        // FIX-02: only request-shaped tools/call frames are forwarded — a
+        // notification-shaped one is dropped locally (no response, no
+        // execution), never sent to the resident owner whose reply the
+        // transport would otherwise wait on.
+        let Some(owner) = owner.filter(|_| line_calls_tool(line) && line_is_request(line)) else {
             return self.handle_line(line);
         };
         let Some(sidecar_config) = self.config.sidecar.as_ref() else {
@@ -704,6 +713,16 @@ fn request_id(line: &str) -> Value {
         .ok()
         .and_then(|message| message.get("id").cloned())
         .unwrap_or(Value::Null)
+}
+
+/// FIX-02: whether the frame carries an `id` key at all (request-shaped, even
+/// when the id is null). A frame without one is a notification and is handled
+/// locally, where dispatch drops it without a response.
+fn line_is_request(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .map(|message| message.get("id").is_some())
+        .unwrap_or(false)
 }
 
 fn line_calls_tool(line: &str) -> bool {
@@ -1264,6 +1283,82 @@ mod tests {
         assert_eq!(tools[0]["annotations"].get("destructiveHint"), None);
         assert_eq!(tools[1]["annotations"]["readOnlyHint"], false);
         assert_eq!(tools[1]["annotations"]["destructiveHint"], true);
+    }
+
+    // FIX-02: known JSON-RPC methods must not reply to notification-shaped
+    // frames (no `id` key), and a notification-shaped tools/call must not
+    // execute; ordinary requests — including the unchanged `id: null` shape —
+    // still respond.
+    #[test]
+    fn notification_shaped_known_methods_get_no_response_and_no_execution() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let server = McpServer::new(ServerConfig::new("todo", "0.1.0", ".").tool(
+            ToolSpec::write(
+                "todo_create",
+                "Create",
+                json!({ "type": "object", "properties": {} }),
+                move |_ctx, _args| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({ "ok": true }))
+                },
+            ),
+        ));
+        for line in [
+            r#"{"jsonrpc":"2.0","method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"resources/list"}"#,
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"todo_create","arguments":{}}}"#,
+        ] {
+            assert_eq!(
+                server.handle_line(line),
+                None,
+                "notification-shaped frame must get no response: {line}"
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a notification-shaped tools/call must not execute the tool"
+        );
+        // Ordinary requests still respond.
+        let raw = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":21,"method":"ping"}"#)
+            .unwrap();
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["id"], 21);
+        let raw = server
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"todo_create","arguments":{}}}"#,
+            )
+            .unwrap();
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["result"]["structuredContent"]["ok"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // `id: null` handling is unchanged: request-shaped, still answered.
+        let raw = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#)
+            .unwrap();
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["id"], Value::Null);
+    }
+
+    // FIX-02: the owner-forwarding fence — a frame with no `id` key is never
+    // forwarded to the resident owner (whose reply the transport would wait
+    // on); it is handled locally, where dispatch drops it.
+    #[test]
+    fn notification_shaped_tools_call_is_never_forwarded_to_an_owner() {
+        assert!(!line_is_request(
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"t","arguments":{}}}"#
+        ));
+        assert!(line_is_request(
+            r#"{"jsonrpc":"2.0","id":null,"method":"tools/call"}"#
+        ));
+        assert!(line_is_request(r#"{"jsonrpc":"2.0","id":7,"method":"tools/call"}"#));
+        assert!(!line_is_request("not json"));
     }
 
     #[test]
