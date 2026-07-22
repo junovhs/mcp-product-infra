@@ -1295,8 +1295,8 @@ mod tests {
         use std::sync::Arc;
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
-        let server = McpServer::new(ServerConfig::new("todo", "0.1.0", ".").tool(
-            ToolSpec::write(
+        let server = McpServer::new(
+            ServerConfig::new("todo", "0.1.0", ".").tool(ToolSpec::write(
                 "todo_create",
                 "Create",
                 json!({ "type": "object", "properties": {} }),
@@ -1304,8 +1304,8 @@ mod tests {
                     seen.fetch_add(1, Ordering::SeqCst);
                     Ok(json!({ "ok": true }))
                 },
-            ),
-        ));
+            )),
+        );
         for line in [
             r#"{"jsonrpc":"2.0","method":"ping"}"#,
             r#"{"jsonrpc":"2.0","method":"tools/list"}"#,
@@ -1357,7 +1357,9 @@ mod tests {
         assert!(line_is_request(
             r#"{"jsonrpc":"2.0","id":null,"method":"tools/call"}"#
         ));
-        assert!(line_is_request(r#"{"jsonrpc":"2.0","id":7,"method":"tools/call"}"#));
+        assert!(line_is_request(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call"}"#
+        ));
         assert!(!line_is_request("not json"));
     }
 
