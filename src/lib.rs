@@ -31,6 +31,9 @@ pub use registry::ToolRegistry;
 pub use resources::{ResourceContent, ResourceEntry, ResourceProvider};
 pub use response::{error_frame, error_frame_for, error_frame_kinded, result_frame, tool_ok};
 pub use server::{BeforeToolHook, McpServer, MutationHook, OwnerProse, ServerConfig};
-pub use sidecar::{OwnerEndpoint, OwnerRecovery, OwnerTransportError, SidecarConfig};
+pub use sidecar::{
+    OwnerEndpoint, OwnerHealth, OwnerHealthReport, OwnerHealthState, OwnerRecovery,
+    OwnerTransportError, SidecarConfig,
+};
 pub use types::kinds;
 pub use types::{MutationKind, ToolContext, ToolError, ToolResult, ToolSpec};

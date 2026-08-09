@@ -55,6 +55,19 @@ fn default_owner_response_timeout_ms() -> u64 {
 /// common case — in-flight work is normally milliseconds.
 const RETIRE_INFLIGHT_WAIT: Duration = Duration::from_secs(2);
 
+/// Response deadline for an `owner/health` query (OWN-01). Deliberately short
+/// and independent of the product response timeout: health is asked when
+/// something already looks wrong, so waiting the app's full operation envelope
+/// (minutes, by default) would make the diagnostic useless exactly when it is
+/// needed. An owner that cannot answer this in seconds has told you something.
+const HEALTH_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the owner waits for the app's health hook before answering without
+/// it. Strictly inside [`HEALTH_QUERY_TIMEOUT`] so a hook that hangs produces
+/// the documented `Unknown` verdict rather than a client-side transport error —
+/// "your health hook is stuck" is a far better answer than silence.
+const HEALTH_HOOK_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OwnerEndpoint {
     pub addr: SocketAddr,
@@ -73,6 +86,13 @@ pub struct OwnerEndpoint {
     /// safe default instead of retaining the former 30-second deadline.
     #[serde(default = "default_owner_response_timeout_ms")]
     pub response_timeout_ms: u64,
+    /// The registered owner runtime's generation (OWN-01). Distinct from
+    /// `token`: the token authenticates and must not be echoed around as an
+    /// identity, while the generation is safe to log, compare, and show a
+    /// human. `serde(default)` = empty for a registration written before
+    /// generations existed, which compares unequal to any live owner's.
+    #[serde(default)]
+    pub generation: String,
 }
 
 /// A hook the owner runs right before it exits (idle-reap or a shutdown
@@ -80,6 +100,91 @@ pub struct OwnerEndpoint {
 /// client-visible error. An interrupted mutation should be crash-safe anyway;
 /// draining keeps routine lifecycle invisible.
 pub type DrainHook = Arc<dyn Fn() + Send + Sync + 'static>;
+
+/// The app's answer to "is your state actually usable right now?" (OWN-01).
+///
+/// Per DEC-03 this is the ONLY thing that may report an owner unhealthy.
+/// Infrastructure knows process liveness and transport reachability; it can
+/// never know that a warm application handle went bad, so it never infers
+/// readiness from handler errors, timeouts, or its own probes.
+pub type HealthHook = Arc<dyn Fn() -> OwnerHealth + Send + Sync + 'static>;
+
+/// The three distinct answers to an owner health query (DEC-03).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerHealthState {
+    /// The app reports its state usable: real operations should work.
+    Ready,
+    /// The app reports its own state broken. The process is alive and the
+    /// socket answers — this is the state that had no name before OWN-01.
+    Unhealthy,
+    /// Nobody competent has an opinion: no health hook is configured, or the
+    /// hook itself failed to answer. Deliberately NOT `Unhealthy` — treating
+    /// an absent or broken hook as a verdict would be infrastructure inferring
+    /// application health, which DEC-03 forbids.
+    Unknown,
+}
+
+/// What an app's [`HealthHook`] returns: a state plus optional human detail.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OwnerHealth {
+    pub state: OwnerHealthState,
+    /// Why, in the app's own words. Carried through to the client verbatim so
+    /// a human sees the app's diagnosis, not a generic infra string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl OwnerHealth {
+    pub fn ready() -> Self {
+        Self {
+            state: OwnerHealthState::Ready,
+            detail: None,
+        }
+    }
+
+    pub fn unhealthy(detail: impl Into<String>) -> Self {
+        Self {
+            state: OwnerHealthState::Unhealthy,
+            detail: Some(detail.into()),
+        }
+    }
+
+    pub fn unknown(detail: impl Into<String>) -> Self {
+        Self {
+            state: OwnerHealthState::Unknown,
+            detail: Some(detail.into()),
+        }
+    }
+
+    /// Attach (or replace) the human detail on any state.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
+/// The answer to an `owner/health` query: the app's readiness verdict plus the
+/// identity of the runtime that produced it.
+///
+/// Identity matters as much as the verdict. "The endpoint answered" is not
+/// "the runtime I registered against is the one serving me": a replacement
+/// owner answers on a fresh socket, and a pid can be recycled. Compare
+/// [`OwnerHealthReport::generation`] against the registration's
+/// [`OwnerEndpoint::generation`] to tell a reload apart from a stale attach.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OwnerHealthReport {
+    pub state: OwnerHealthState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub pid: u32,
+    /// The answering owner's build fingerprint (see [`OwnerEndpoint`]).
+    pub fingerprint: String,
+    /// Identifies this owner *runtime*, not this owner *build*: a replacement
+    /// owner always reports a different generation, even for the same build,
+    /// the same binary, and (on a recycled pid) the same pid.
+    pub generation: String,
+}
 
 #[derive(Clone)]
 pub struct SidecarConfig {
@@ -112,6 +217,11 @@ pub struct SidecarConfig {
     pub response_timeout: Duration,
     /// Drain hook run before an owner exit (idle-reap or shutdown request).
     pub drain: Option<DrainHook>,
+    /// The app's readiness hook (OWN-01). `None` means every health query
+    /// answers [`OwnerHealthState::Unknown`]: an app that has not said how to
+    /// tell ready from wedged does not get infrastructure guessing on its
+    /// behalf (DEC-03).
+    pub health: Option<HealthHook>,
 }
 
 impl std::fmt::Debug for SidecarConfig {
@@ -128,6 +238,7 @@ impl std::fmt::Debug for SidecarConfig {
             .field("idle_timeout_env", &self.idle_timeout_env)
             .field("response_timeout", &self.response_timeout)
             .field("drain", &self.drain.as_ref().map(|_| "<hook>"))
+            .field("health", &self.health.as_ref().map(|_| "<hook>"))
             .finish()
     }
 }
@@ -151,6 +262,7 @@ impl SidecarConfig {
             idle_timeout_env: None,
             response_timeout: DEFAULT_OWNER_RESPONSE_TIMEOUT,
             drain: None,
+            health: None,
         }
     }
 
@@ -194,6 +306,20 @@ impl SidecarConfig {
         self
     }
 
+    /// Supply the app's readiness hook (OWN-01). It runs on the owner, inside
+    /// an `owner/health` request, and should be cheap and non-blocking.
+    ///
+    /// "Should" is not "must": the hook is consulted precisely when the app may
+    /// be wedged, which is exactly when touching app state can block forever.
+    /// So the hook installed here is wrapped in a containment that bounds the
+    /// damage a hanging hook can do — see [`guarded_health_hook`]. Construct
+    /// the config through this builder rather than assigning the `health` field
+    /// directly, or you opt out of that containment.
+    pub fn health(mut self, hook: impl Fn() -> OwnerHealth + Send + Sync + 'static) -> Self {
+        self.health = Some(guarded_health_hook(Arc::new(hook)));
+        self
+    }
+
     pub fn endpoint_path(&self) -> PathBuf {
         self.cache_dir.join("mcp-owner.json")
     }
@@ -214,6 +340,23 @@ impl SidecarConfig {
     fn run_drain(&self) {
         if let Some(drain) = &self.drain {
             drain();
+        }
+    }
+
+    /// Ask the app how it is. A missing hook answers `Unknown`; so does a hook
+    /// that panics — a broken hook is an absent opinion, never a verdict of
+    /// unhealthy (DEC-03). Catching the panic also keeps one bad hook from
+    /// killing the connection thread that is trying to report the trouble.
+    fn run_health(&self) -> OwnerHealth {
+        let Some(health) = &self.health else {
+            return OwnerHealth::unknown("no application health hook is configured");
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| health())) {
+            Ok(health) => health,
+            Err(payload) => OwnerHealth::unknown(format!(
+                "application health hook panicked: {}",
+                crate::types::panic_message(payload.as_ref())
+            )),
         }
     }
 }
@@ -362,6 +505,7 @@ pub fn run_owner_server(
         pid: std::process::id(),
         fingerprint: current_build_fingerprint(&config),
         response_timeout_ms: config.response_timeout.as_millis() as u64,
+        generation: new_generation(),
     };
     write_endpoint(&config, &endpoint)?;
     // Only the lock holder ever reaches here, so it is the sole author of the
@@ -403,15 +547,21 @@ pub fn run_owner_server(
                 let _ = stream.set_read_timeout(Some(OWNER_STREAM_IO_TIMEOUT));
                 let _ = stream.set_write_timeout(Some(OWNER_STREAM_IO_TIMEOUT));
                 let token = endpoint.token.clone();
+                let identity = endpoint.clone();
                 let handler = handler.clone();
                 let config = config.clone();
                 let guard = InflightGuard::enter(&inflight);
                 let retire = retiring.clone();
                 thread::spawn(move || {
                     let _guard = guard;
-                    let _ = handle_owner_stream(&config, &token, stream, &retire, move |line| {
-                        handler(line)
-                    });
+                    let _ = handle_owner_stream(
+                        &config,
+                        &token,
+                        &identity,
+                        stream,
+                        &retire,
+                        move |line| handler(line),
+                    );
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -516,14 +666,28 @@ pub fn send_line(
     endpoint: &OwnerEndpoint,
     line: &str,
 ) -> Result<Option<String>, OwnerTransportError> {
+    send_line_within(
+        endpoint,
+        line,
+        Duration::from_millis(endpoint.response_timeout_ms.max(1)),
+    )
+}
+
+/// [`send_line`] with an explicit response deadline. The health query uses a
+/// short one: an owner's product deadline can be minutes (a legitimately slow
+/// operation), but "are you wedged?" must come back fast or it is useless as a
+/// diagnostic.
+fn send_line_within(
+    endpoint: &OwnerEndpoint,
+    line: &str,
+    response_timeout: Duration,
+) -> Result<Option<String>, OwnerTransportError> {
     let mut stream =
         TcpStream::connect_timeout(&endpoint.addr, Duration::from_secs(1)).map_err(|e| {
             OwnerTransportError::Connect(format!("failed to connect to resident MCP owner: {e}"))
         })?;
     stream
-        .set_read_timeout(Some(Duration::from_millis(
-            endpoint.response_timeout_ms.max(1),
-        )))
+        .set_read_timeout(Some(response_timeout.max(Duration::from_millis(1))))
         .map_err(|e| {
             OwnerTransportError::Write(format!("failed to set MCP owner read timeout: {e}"))
         })?;
@@ -561,9 +725,76 @@ pub fn send_line(
     Ok(response.response)
 }
 
+/// Ask a registered owner what state its application is in (OWN-01).
+///
+/// This is the state nothing could name before: `ping` says the socket answers,
+/// `process_is_alive` says the pid exists, the fingerprint says the build is
+/// current — and every real operation still fails. Only the app's health hook
+/// can report that, and only through here.
+///
+/// The three outcomes are all different facts, and callers should keep them
+/// apart:
+///  - `Ok(report)` with [`OwnerHealthState::Unhealthy`] — the app says it is
+///    broken. Actionable: this owner will keep failing until it is replaced.
+///  - `Ok(report)` with [`OwnerHealthState::Unknown`] — nobody has an opinion
+///    (no hook, or the hook failed to answer). Not evidence of trouble.
+///  - `Err(_)` — the owner did not answer the control plane at all within the
+///    health deadline. That is evidence about the *transport or the process*,
+///    not the app's verdict, so it must never be reported as "unhealthy".
+///
+/// An identity mismatch between the report and `endpoint` (a different pid,
+/// fingerprint, or generation) is deliberately NOT an error: it is the fact
+/// that the runtime was replaced under you, which is exactly what a caller
+/// watching for a reload wants to read. Compare, don't assume.
+///
+/// A mutation is never sent here: this is a read of the owner's condition, so a
+/// lost reply costs nothing and is always safe to retry.
+pub fn query_owner_health(
+    endpoint: &OwnerEndpoint,
+) -> Result<OwnerHealthReport, OwnerTransportError> {
+    let raw = send_line_within(
+        endpoint,
+        r#"{"jsonrpc":"2.0","id":0,"method":"owner/health"}"#,
+        HEALTH_QUERY_TIMEOUT,
+    )?
+    .ok_or_else(|| {
+        OwnerTransportError::MalformedResponse(
+            "resident MCP owner returned no health frame".to_string(),
+        )
+    })?;
+    let frame: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        OwnerTransportError::MalformedResponse(format!("malformed owner health frame: {e}"))
+    })?;
+    // An owner too old to know `owner/health` answers METHOD_NOT_FOUND through
+    // the app handler. That is a missing capability, not a verdict — surface it
+    // as a parse-level failure so it can never be mistaken for `unhealthy`.
+    let result = frame.get("result").ok_or_else(|| {
+        OwnerTransportError::MalformedResponse(format!(
+            "resident MCP owner did not answer owner/health: {raw}"
+        ))
+    })?;
+    let report: OwnerHealthReport = serde_json::from_value(result.clone()).map_err(|e| {
+        OwnerTransportError::MalformedResponse(format!("malformed owner health report: {e}"))
+    })?;
+    // Provenance (OWN-01 review). `owner/health` is only intercepted by the
+    // control plane on an owner that knows the method; on an older one the line
+    // falls through to the app handler, and a permissive catch-all handler
+    // could answer with something report-shaped — an `unhealthy` verdict no
+    // health hook ever produced. The generation is the tell: it is minted by
+    // the control plane, so a report without one did not come from there.
+    if report.generation.is_empty() {
+        return Err(OwnerTransportError::MalformedResponse(format!(
+            "owner health report carries no runtime generation, so it did not come from the \
+             owner control plane: {raw}"
+        )));
+    }
+    Ok(report)
+}
+
 fn handle_owner_stream(
     config: &SidecarConfig,
     token: &str,
+    identity: &OwnerEndpoint,
     stream: TcpStream,
     retiring: &AtomicBool,
     handler: impl Fn(&str) -> Option<String>,
@@ -591,6 +822,31 @@ fn handle_owner_stream(
         write_owner_response(stream, OwnerResponse { response: ack })?;
         retiring.store(true, Ordering::SeqCst);
         return Ok(());
+    }
+
+    // OWN-01: readiness answered on the control plane, ahead of MCP dispatch,
+    // so the question "is this owner broken, or did my call just get refused?"
+    // is answerable even when every app operation is failing. Deliberately not
+    // routed through the app handler: a wedged app is exactly when the handler
+    // cannot be trusted to answer.
+    if request.token == token && line_method(&request.line).as_deref() == Some("owner/health") {
+        let health = config.run_health();
+        let report = OwnerHealthReport {
+            state: health.state,
+            detail: health.detail,
+            pid: identity.pid,
+            fingerprint: identity.fingerprint.clone(),
+            generation: identity.generation.clone(),
+        };
+        let frame = serde_json::to_value(&report)
+            .map(|result| crate::response::result_frame(line_id(&request.line), result))
+            .map_err(|e| format!("failed to encode owner health report: {e}"))?;
+        return write_owner_response(
+            stream,
+            OwnerResponse {
+                response: Some(frame),
+            },
+        );
     }
 
     let response = if request.token == token {
@@ -782,12 +1038,102 @@ fn line_method(line: &str) -> Option<String> {
         .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_string))
 }
 
+/// Wrap an app health hook so a hook that never returns cannot take the owner
+/// down with it (OWN-01 review).
+///
+/// Rust cannot cancel a running thread, so containment here means two things:
+///
+///  - **Bounded wait.** The hook runs on its own thread and the connection
+///    thread waits only [`HEALTH_HOOK_TIMEOUT`] for it. The client gets the
+///    documented `Unknown` — "the hook did not answer" is itself a diagnosis —
+///    instead of the connection thread parking forever with the socket and its
+///    in-flight count held.
+///  - **Single flight.** While an invocation is still out, further queries
+///    answer immediately without spawning another thread. A stuck hook
+///    therefore leaks exactly one thread for the owner's lifetime, not one per
+///    diagnostic — and repeatedly asking a wedged owner how it is is the most
+///    predictable thing a worried client or human does.
+///
+/// The panic guard lives here too, so a panicking hook is reported by the same
+/// path as one that hangs: an absent opinion (`Unknown`), never a verdict.
+fn guarded_health_hook(hook: HealthHook) -> HealthHook {
+    let inflight = Arc::new(AtomicBool::new(false));
+    Arc::new(move || {
+        if inflight.swap(true, Ordering::SeqCst) {
+            return OwnerHealth::unknown(
+                "a previous application health hook invocation has not returned",
+            );
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let hook = hook.clone();
+        let inflight = inflight.clone();
+        thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook()));
+            // Release the slot BEFORE sending: if the receiver already timed
+            // out, the send fails, and a hook that did eventually answer must
+            // not leave the owner permanently claiming one is still running.
+            inflight.store(false, Ordering::SeqCst);
+            let _ = tx.send(outcome);
+        });
+        match rx.recv_timeout(HEALTH_HOOK_TIMEOUT) {
+            Ok(Ok(health)) => health,
+            Ok(Err(payload)) => OwnerHealth::unknown(format!(
+                "application health hook panicked: {}",
+                crate::types::panic_message(payload.as_ref())
+            )),
+            Err(_) => OwnerHealth::unknown(format!(
+                "application health hook did not answer within {}s",
+                HEALTH_HOOK_TIMEOUT.as_secs_f32()
+            )),
+        }
+    })
+}
+
+/// The JSON-RPC `id` of a raw owner-request line, so a control-plane reply
+/// echoes the caller's id instead of inventing one. Absent/unparseable reads as
+/// `null`, which is what a malformed request deserves.
+fn line_id(line: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("id").cloned())
+        .unwrap_or(serde_json::Value::Null)
+}
+
 fn new_token() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{}-{nanos}", std::process::id())
+}
+
+/// A fresh owner-runtime generation (OWN-01): 128 OS-random bits, hex.
+///
+/// The generation exists to be shown, logged, and compared — that is its whole
+/// job — so it must carry NO information about `token`, which is the credential
+/// authorizing owner requests including mutations. Deriving it the obvious way
+/// (pid plus a clock reading, mirroring [`new_token`]) would publish most of
+/// the token's entropy and narrow a brute-force search to a microsecond-wide
+/// window, using the invalid-token reply as an oracle. Independent randomness
+/// severs that link, and 128 bits also makes "a replacement never repeats a
+/// generation" true outright rather than by argument about pid reuse and clock
+/// monotonicity.
+fn new_generation() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        // Randomness is unavailable only in exotic environments. Fall back to a
+        // value that is still unique in practice, and mark it so a reader knows
+        // the identity is weaker — never silently degrade to a token-shaped
+        // string that leaks nothing but also proves nothing.
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        return format!("degraded-{}-{nanos}-{seq}", std::process::id());
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Resolve the executable to spawn the resident owner with. `current_exe()` is
@@ -954,6 +1300,7 @@ pub mod test_support {
             pid: std::process::id(),
             fingerprint: current_build_fingerprint(config),
             response_timeout_ms: config.response_timeout.as_millis() as u64,
+            generation: new_generation(),
         }
     }
 
@@ -997,8 +1344,10 @@ pub mod test_support {
             pid: std::process::id(),
             fingerprint: current_build_fingerprint(&config),
             response_timeout_ms: config.response_timeout.as_millis() as u64,
+            generation: new_generation(),
         };
         let token = endpoint.token.clone();
+        let identity = endpoint.clone();
         let handler = Arc::new(handler);
         thread::spawn(move || {
             let retiring = AtomicBool::new(false);
@@ -1010,9 +1359,14 @@ pub mod test_support {
                             handler(line)
                         });
                 } else {
-                    let _ = handle_owner_stream(&config, &token, stream, &retiring, move |line| {
-                        handler(line)
-                    });
+                    let _ = handle_owner_stream(
+                        &config,
+                        &token,
+                        &identity,
+                        stream,
+                        &retiring,
+                        move |line| handler(line),
+                    );
                 }
                 if retiring.load(Ordering::SeqCst) {
                     break;
@@ -1062,6 +1416,32 @@ mod tests {
 
     fn config(dir: &Path) -> SidecarConfig {
         SidecarConfig::new("testapp", dir, dir.join("cache")).app_version("1.2.3")
+    }
+
+    /// A hand-rolled owner that answers every request with `reply`, bypassing
+    /// this build's control plane entirely — the stand-in for an owner built
+    /// before `owner/health` existed, where the method reaches the app handler.
+    /// Returns the address to point an endpoint at.
+    fn raw_owner(reply: impl Fn(&str) -> String + Send + 'static) -> SocketAddr {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind raw owner");
+        let addr = listener.local_addr().expect("raw owner addr");
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().expect("clone raw stream"));
+                let mut raw = String::new();
+                let _ = reader.read_line(&mut raw);
+                let line = serde_json::from_str::<OwnerRequest>(raw.trim_end())
+                    .map(|request| request.line)
+                    .unwrap_or_default();
+                let _ = write_owner_response(
+                    stream,
+                    OwnerResponse {
+                        response: Some(reply(&line)),
+                    },
+                );
+            }
+        });
+        addr
     }
 
     #[test]
@@ -1336,6 +1716,7 @@ mod tests {
             pid: std::process::id(),
             fingerprint: current_build_fingerprint(&cfg),
             response_timeout_ms: cfg.response_timeout.as_millis() as u64,
+            generation: new_generation(),
         };
         write_endpoint(&cfg, &ep).unwrap();
         let read = read_endpoint(&cfg).expect("registration read back");
@@ -1358,6 +1739,274 @@ mod tests {
             .expect("handler completed within the configured response deadline")
             .expect("slow handler returned a response");
         assert!(response.contains(r#""slow":true"#));
+    }
+
+    // OWN-01 — an app that never said how to tell ready from wedged gets no
+    // verdict invented for it (DEC-03): the answer is "nobody knows", which is
+    // a different fact from "broken".
+    #[test]
+    fn a_missing_health_hook_answers_unknown_not_unhealthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let health = config(dir.path()).run_health();
+        assert_eq!(health.state, OwnerHealthState::Unknown);
+        assert!(
+            health.detail.unwrap_or_default().contains("no application"),
+            "the absent hook must say so in plain words"
+        );
+    }
+
+    // A hook that panics is a broken opinion, not a diagnosis. Reporting it as
+    // `Unhealthy` would let one buggy hook condemn a perfectly good owner (and,
+    // once DEC-06 retirement exists, retire it in a loop).
+    #[test]
+    fn a_panicking_health_hook_answers_unknown_and_never_kills_the_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path()).health(|| panic!("hook is broken"));
+        let health = cfg.run_health();
+        assert_eq!(health.state, OwnerHealthState::Unknown);
+        let detail = health.detail.unwrap_or_default();
+        assert!(detail.contains("panicked"), "unexpected detail: {detail}");
+        assert!(
+            detail.contains("hook is broken"),
+            "the panic message must survive: {detail}"
+        );
+    }
+
+    // The crux of OWN-01 over a real socket: reachable and unhealthy at once.
+    #[test]
+    fn a_reachable_owner_can_report_itself_unhealthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path())
+            .health(|| OwnerHealth::unhealthy("project database handle returned None"));
+        let owner = test_support::start_owner_thread(cfg, |_line| {
+            Some(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#.to_string())
+        })
+        .unwrap();
+
+        // Every pre-OWN-01 check still says "fine".
+        assert!(
+            send_line(&owner, r#"{"jsonrpc":"2.0","id":0,"method":"ping"}"#).is_ok(),
+            "the transport must still answer — that is the whole trap"
+        );
+        assert!(process_is_alive(owner.pid));
+
+        let report = query_owner_health(&owner).expect("health query answers");
+        assert_eq!(report.state, OwnerHealthState::Unhealthy);
+        assert_eq!(
+            report.detail.as_deref(),
+            Some("project database handle returned None"),
+            "the app's own words must reach the client verbatim"
+        );
+        assert_eq!(report.pid, owner.pid);
+        assert_eq!(report.fingerprint, owner.fingerprint);
+        assert_eq!(report.generation, owner.generation);
+    }
+
+    // Handler failures are the app refusing a call, not the owner being sick.
+    // Infra must never promote one into the other (DEC-03).
+    #[test]
+    fn a_handler_error_leaves_the_reported_health_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path()).health(OwnerHealth::ready);
+        let owner = test_support::start_owner_thread(cfg, |_line| {
+            Some(crate::response::error_frame_for(
+                serde_json::Value::from(1),
+                &crate::types::ToolError::server("handler exploded")
+                    .with_kind(crate::types::kinds::INTERNAL),
+            ))
+        })
+        .unwrap();
+
+        let before = query_owner_health(&owner).expect("health before");
+        let failure = send_line(&owner, r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#)
+            .expect("the owner answers")
+            .expect("an error frame is still a response");
+        assert!(
+            failure.contains("handler exploded"),
+            "unexpected frame: {failure}"
+        );
+
+        let after = query_owner_health(&owner).expect("health after");
+        assert_eq!(after, before, "a handler error must not move owner health");
+        assert_eq!(after.state, OwnerHealthState::Ready);
+        assert!(process_is_alive(owner.pid), "and must not retire the owner");
+    }
+
+    // Health is a control-plane fact, so it must be answerable by an owner
+    // whose app handler answers nothing at all — the wedged case.
+    #[test]
+    fn health_is_answered_without_consulting_the_app_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path()).health(|| OwnerHealth::unhealthy("wedged"));
+        let owner = test_support::start_owner_thread(cfg, |_line| None).unwrap();
+
+        let report = query_owner_health(&owner).expect("health answers past a silent handler");
+        assert_eq!(report.state, OwnerHealthState::Unhealthy);
+    }
+
+    // The generation is a public identity; the token is a credential. Keeping
+    // them distinct means "which runtime is this?" can be logged and compared
+    // without spreading the secret that authorizes owner requests.
+    #[test]
+    fn the_generation_is_not_the_token_and_changes_per_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let first = test_support::unreachable_endpoint(&cfg);
+        let second = test_support::unreachable_endpoint(&cfg);
+        assert_ne!(first.generation, first.token);
+        assert_ne!(
+            first.generation, second.generation,
+            "two owner runtimes must never share a generation"
+        );
+        // OWN-01 review, the real point: the generation is published, so it
+        // must not hand out the shape of the credential beside it. A pid or a
+        // clock reading in here narrows a token brute-force to a microsecond.
+        assert_eq!(first.generation.len(), 32, "128 random bits, hex");
+        assert!(
+            first.generation.chars().all(|c| c.is_ascii_hexdigit()),
+            "an opaque identity, not a structured one: {}",
+            first.generation
+        );
+        assert!(
+            !first.generation.contains(&std::process::id().to_string()),
+            "the generation must not publish the pid the token is built from"
+        );
+    }
+
+    // A hook that hangs is the likeliest hook failure, because the state it
+    // consults is the state that is wedged. It must not park the connection
+    // thread (and its socket) forever, and repeated worried queries must not
+    // spawn a thread each.
+    #[test]
+    fn a_hanging_health_hook_answers_unknown_and_leaks_only_one_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let (hook_release, hook_entered) = (release.clone(), entered.clone());
+        let cfg = config(dir.path()).health(move || {
+            hook_entered.fetch_add(1, Ordering::SeqCst);
+            while !hook_release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            OwnerHealth::ready()
+        });
+
+        let started = Instant::now();
+        let first = cfg.run_health();
+        assert_eq!(first.state, OwnerHealthState::Unknown);
+        assert!(
+            first.detail.unwrap_or_default().contains("did not answer"),
+            "a stuck hook must say so"
+        );
+        assert!(
+            started.elapsed() < HEALTH_HOOK_TIMEOUT + Duration::from_secs(2),
+            "the wait must be bounded, not the hook's lifetime"
+        );
+
+        // Single flight: while the first invocation is still out, the next
+        // query answers straight away and starts nothing new.
+        let again = Instant::now();
+        let second = cfg.run_health();
+        assert_eq!(second.state, OwnerHealthState::Unknown);
+        assert!(
+            second
+                .detail
+                .unwrap_or_default()
+                .contains("has not returned"),
+            "the second query must report the stuck invocation, not start another"
+        );
+        assert!(
+            again.elapsed() < Duration::from_secs(1),
+            "and must not wait"
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "exactly one hook invocation may be outstanding"
+        );
+
+        // Let the stuck hook finish; the slot must free so health works again.
+        release.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let recovered = cfg.run_health();
+            if recovered.state == OwnerHealthState::Ready {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a hook that eventually answers must not wedge health forever"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // OWN-01 review: on an owner too old to intercept `owner/health`, the line
+    // reaches the app handler. A permissive catch-all could answer with
+    // something report-shaped — an `unhealthy` verdict no health hook produced.
+    #[test]
+    fn a_report_shaped_reply_from_an_app_handler_is_not_accepted_as_a_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        // A pre-OWN-01 owner: no control-plane interception, so `owner/health`
+        // lands in an app handler that answers with a plausible-looking report.
+        let legacy = raw_owner(move |_line| {
+            r#"{"jsonrpc":"2.0","id":0,"result":{"state":"unhealthy","detail":"forged",
+                "pid":1,"fingerprint":"x"}}"#
+                .to_string()
+        });
+        let owner = OwnerEndpoint {
+            addr: legacy,
+            ..test_support::unreachable_endpoint(&cfg)
+        };
+
+        match query_owner_health(&owner) {
+            Err(OwnerTransportError::MalformedResponse(message)) => assert!(
+                message.contains("generation"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("an app handler must not be able to forge a verdict: {other:?}"),
+        }
+    }
+
+    // A registration written before generations existed must not be mistaken
+    // for a live owner's identity.
+    #[test]
+    fn a_legacy_registration_carries_no_generation() {
+        let json = r#"{"addr":"127.0.0.1:5000","token":"t","pid":42}"#;
+        let ep: OwnerEndpoint = serde_json::from_str(json).expect("legacy json deserializes");
+        assert!(ep.generation.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        assert_ne!(
+            ep.generation,
+            test_support::unreachable_endpoint(&config(dir.path())).generation
+        );
+    }
+
+    // An owner too old to know owner/health answers METHOD_NOT_FOUND through
+    // the app handler. Absence of the capability must never read as a verdict.
+    #[test]
+    fn an_owner_without_the_health_method_is_an_error_not_an_unhealthy_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let addr = raw_owner(|_line| {
+            crate::response::error_frame(
+                serde_json::Value::from(0),
+                crate::types::METHOD_NOT_FOUND,
+                "Method not found: owner/health",
+            )
+        });
+        let legacy = OwnerEndpoint {
+            addr,
+            ..test_support::unreachable_endpoint(&cfg)
+        };
+
+        match query_owner_health(&legacy) {
+            Err(OwnerTransportError::MalformedResponse(message)) => {
+                assert!(message.contains("owner/health"), "unexpected: {message}")
+            }
+            other => panic!("a missing capability must not read as a verdict: {other:?}"),
+        }
     }
 
     #[cfg(target_os = "linux")]
