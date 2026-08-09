@@ -6,6 +6,7 @@
 //! loop, typed tool registry, structured responses, read/write dispatch,
 //! optional sidecar ownership, and no-clobber host config installers.
 
+pub mod activity;
 pub mod adapters;
 pub mod agent_guard;
 pub mod capture;
@@ -18,6 +19,7 @@ pub mod shell_guard;
 pub mod sidecar;
 pub mod types;
 
+pub use activity::{ActivityLease, ActivityView};
 pub use adapters::{
     AdapterAction, ClaudeHook, HostConfigFact, HostInstall, HostReadinessReport, HostServer,
     InstallReport,

@@ -487,6 +487,13 @@ impl McpServer {
                 Some(self.resources_read(id, &message))
             }
             "ping" => Some(result_frame(id, json!({}))),
+            // BUSY-01: what is running right now, and for how long. Routed
+            // through the same handler the resident owner serves, so an agent
+            // asking a busy owner "are you working or wedged?" gets a fact.
+            "activity/list" => Some(result_frame(
+                id,
+                json!({ "activities": crate::activity::snapshot() }),
+            )),
             _ if method.starts_with("notifications/") => None,
             _ => is_request.then(|| {
                 error_frame_kinded(
@@ -708,6 +715,11 @@ impl McpServer {
             .and_then(|p| p.get("arguments"))
             .cloned()
             .unwrap_or_else(|| json!({}));
+
+        // BUSY-01: register the call for the duration of the handler, so a slow
+        // one is visible as running work rather than silence. The lease releases
+        // on Drop — including the panic path caught just below.
+        let _activity = crate::activity::begin(format!("{name} (tools/call)"));
 
         // A panic in a handler must not take down the long-running server (or,
         // worse, silently kill the FIFO mutation worker). Contain it here and
@@ -1897,5 +1909,119 @@ mod tests {
 
         assert_eq!(frame["error"]["data"]["kind"], kinds::INVALID_INPUT);
         assert_eq!(frame["error"]["data"]["tool"], "todo_nope");
+    }
+
+    // ---- BUSY-01: a working slow call is distinguishable from a hung one ----
+
+    /// While a slow tool is still running, `activity/list` over the same frame
+    /// surface names it with a growing elapsed time — the exact fact missing
+    /// during the 226-second incident, where a healthy server hashing 5.1 GB
+    /// looked identical to a wedge. Once the call returns, the lease is gone.
+    #[test]
+    fn a_running_tool_call_is_visible_in_activity_list_until_it_returns() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+
+        let server = std::sync::Arc::new(McpServer::new(
+            ServerConfig::new("todo", "0.1.0", ".").tool(ToolSpec::read(
+                "todo_slow",
+                "Slow",
+                json!({ "type": "object", "properties": {} }),
+                move |_ctx, _args| {
+                    entered_tx.send(()).unwrap();
+                    let _ = release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10));
+                    Ok(json!({ "done": true }))
+                },
+            )),
+        ));
+
+        let worker = {
+            let server = server.clone();
+            std::thread::spawn(move || {
+                server.handle_line(
+                    &json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": { "name": "todo_slow", "arguments": {} }
+                    })
+                    .to_string(),
+                )
+            })
+        };
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the slow handler must start");
+
+        let query = json!({ "jsonrpc": "2.0", "id": 2, "method": "activity/list" }).to_string();
+        let first: Value = serde_json::from_str(&server.handle_line(&query).unwrap()).unwrap();
+        let running = first["result"]["activities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["label"] == "todo_slow (tools/call)")
+            .cloned()
+            .expect("the in-flight call must be listed");
+        let first_elapsed = running["elapsed_ms"].as_u64().unwrap();
+
+        std::thread::sleep(Duration::from_millis(30));
+        let second: Value = serde_json::from_str(&server.handle_line(&query).unwrap()).unwrap();
+        let later_elapsed = second["result"]["activities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["label"] == "todo_slow (tools/call)")
+            .and_then(|a| a["elapsed_ms"].as_u64())
+            .expect("still running");
+        assert!(
+            later_elapsed > first_elapsed,
+            "elapsed must grow while the call runs: {first_elapsed} -> {later_elapsed}"
+        );
+
+        release_tx.send(()).unwrap();
+        worker.join().unwrap().expect("the slow call must answer");
+
+        let after: Value = serde_json::from_str(&server.handle_line(&query).unwrap()).unwrap();
+        assert!(
+            !after["result"]["activities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["label"] == "todo_slow (tools/call)"),
+            "the lease must release when the call returns"
+        );
+    }
+
+    /// A handler that panics still releases its lease — otherwise one bad tool
+    /// would leave a phantom "running" entry forever.
+    #[test]
+    fn a_panicking_tool_call_leaves_no_activity_behind() {
+        let server = panicking_server(false);
+        let raw = with_quiet_panics(|| {
+            server
+                .handle_line(
+                    &json!({
+                        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                        "params": { "name": "todo_boom", "arguments": {} }
+                    })
+                    .to_string(),
+                )
+                .unwrap()
+        });
+        let frame: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(frame["error"]["code"], INTERNAL_ERROR);
+
+        assert!(
+            !crate::activity::snapshot()
+                .iter()
+                .any(|view| view.label.starts_with("todo_boom")),
+            "a panicking handler must not leak its activity lease"
+        );
     }
 }

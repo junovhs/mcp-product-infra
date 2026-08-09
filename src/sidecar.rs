@@ -867,7 +867,7 @@ fn current_build_fingerprint(config: &SidecarConfig) -> String {
 /// never mistaken for dead — a false-dead would spawn a second resident
 /// writer. Only a definitive "no such process" (or a corpse) reads as dead.
 #[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
+pub(crate) fn process_is_alive(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if rc == 0 {
         // An exited-but-unreaped child (zombie) still passes kill(pid, 0) — the
@@ -909,7 +909,7 @@ fn process_is_zombie(pid: u32) -> bool {
 /// not proof of life. Confirm with the exit code: a still-running process
 /// reports STILL_ACTIVE (259); any settled exit code means dead.
 #[cfg(windows)]
-fn process_is_alive(pid: u32) -> bool {
+pub(crate) fn process_is_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -931,7 +931,7 @@ fn process_is_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn process_is_alive(_pid: u32) -> bool {
+pub(crate) fn process_is_alive(_pid: u32) -> bool {
     true
 }
 
