@@ -89,6 +89,8 @@ pub fn dispatch_op(
 ) -> crate::types::ToolResult {
     let op = args.get("op").and_then(Value::as_str).ok_or_else(|| {
         crate::types::ToolError::invalid_params(format!("{entity} requires an `op` field"))
+            .with_kind(crate::types::kinds::INVALID_INPUT)
+            .with_data(serde_json::json!({ "entity": entity, "missing_field": "op" }))
     })?;
 
     for (name, handler) in table {
@@ -109,7 +111,9 @@ pub fn dispatch_op(
     Err(crate::types::ToolError::invalid_params(format!(
         "{entity}: unknown op '{op}'; expected one of {}",
         known.join("/")
-    )))
+    ))
+    .with_kind(crate::types::kinds::INVALID_INPUT)
+    .with_data(serde_json::json!({ "entity": entity, "op": op, "expected": known })))
 }
 
 pub fn op_is_read(args: &Value, read_ops: &[&str]) -> bool {

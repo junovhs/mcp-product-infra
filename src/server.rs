@@ -10,8 +10,9 @@
 //! - shutdown drain and parent-death watchdogs
 
 use crate::registry::ToolRegistry;
-use crate::response::{error_frame, result_frame, tool_ok};
+use crate::response::{error_frame, error_frame_kinded, result_frame, tool_ok};
 use crate::sidecar::{self, OwnerEndpoint, OwnerRecovery, SidecarConfig};
+use crate::types::kinds;
 use crate::types::{
     ToolContext, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
     OWNER_SERVICE_UNAVAILABLE, PARSE_ERROR,
@@ -439,10 +440,12 @@ impl McpServer {
         let message: Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(error) => {
-                return Some(error_frame(
+                return Some(error_frame_kinded(
                     Value::Null,
                     PARSE_ERROR,
                     &format!("Parse error: {error}"),
+                    Some(kinds::INVALID_INPUT),
+                    None,
                 ))
             }
         };
@@ -452,8 +455,15 @@ impl McpServer {
         let method = match message.get("method").and_then(Value::as_str) {
             Some(method) => method,
             None => {
-                return is_request
-                    .then(|| error_frame(id, INVALID_REQUEST, "Invalid Request: missing method"))
+                return is_request.then(|| {
+                    error_frame_kinded(
+                        id,
+                        INVALID_REQUEST,
+                        "Invalid Request: missing method",
+                        Some(kinds::INVALID_INPUT),
+                        None,
+                    )
+                })
             }
         };
 
@@ -478,8 +488,15 @@ impl McpServer {
             }
             "ping" => Some(result_frame(id, json!({}))),
             _ if method.starts_with("notifications/") => None,
-            _ => is_request
-                .then(|| error_frame(id, METHOD_NOT_FOUND, &format!("Method not found: {method}"))),
+            _ => is_request.then(|| {
+                error_frame_kinded(
+                    id,
+                    METHOD_NOT_FOUND,
+                    &format!("Method not found: {method}"),
+                    Some(kinds::INVALID_INPUT),
+                    Some(&json!({ "method": method })),
+                )
+            }),
         }
     }
 
@@ -506,10 +523,12 @@ impl McpServer {
             // committed. Do NOT recover/re-send (that double-applies), and do NOT
             // claim "write refused". Tell the agent to verify before retrying.
             Err(error) if self.line_calls_mutating_tool(line) && error.may_have_committed() => {
-                Some(error_frame(
+                Some(error_frame_kinded(
                     request_id(line),
                     prose.code,
                     &prose.ambiguous_commit(error.message()),
+                    Some(kinds::OUTCOME_UNKNOWN),
+                    Some(&json!({ "retry_safe": false })),
                 ))
             }
             // The resident owner is unreachable before delivery. A mutation must
@@ -525,26 +544,34 @@ impl McpServer {
                 match sidecar::recover_owner(sidecar_config, owner) {
                     OwnerRecovery::Reelected(fresh) => match sidecar::send_line(&fresh, line) {
                         Ok(response) => response,
-                        Err(error) if error.may_have_committed() => Some(error_frame(
+                        Err(error) if error.may_have_committed() => Some(error_frame_kinded(
                             request_id(line),
                             prose.code,
                             &prose.ambiguous_commit(error.message()),
+                            Some(kinds::OUTCOME_UNKNOWN),
+                            Some(&json!({ "retry_safe": false })),
                         )),
-                        Err(error) => Some(error_frame(
+                        Err(error) => Some(error_frame_kinded(
                             request_id(line),
                             prose.code,
                             &prose.reelected_unreachable(error.message()),
+                            Some(kinds::TRANSPORT_FAILURE),
+                            Some(&json!({ "retry_safe": true })),
                         )),
                     },
-                    OwnerRecovery::LiveButUnreachable => Some(error_frame(
+                    OwnerRecovery::LiveButUnreachable => Some(error_frame_kinded(
                         request_id(line),
                         prose.code,
                         &prose.live_but_unreachable(),
+                        Some(kinds::OWNER_UNHEALTHY),
+                        Some(&json!({ "retry_safe": true })),
                     )),
-                    OwnerRecovery::Down(error) => Some(error_frame(
+                    OwnerRecovery::Down(error) => Some(error_frame_kinded(
                         request_id(line),
                         prose.code,
                         &prose.down(&error),
+                        Some(kinds::OWNER_UNHEALTHY),
+                        Some(&json!({ "retry_safe": true })),
                     )),
                 }
             }
@@ -592,7 +619,13 @@ impl McpServer {
     /// invalid-params error.
     fn resources_read(&self, id: Value, message: &Value) -> String {
         let Some(provider) = self.config.resources.as_ref() else {
-            return error_frame(id, METHOD_NOT_FOUND, "Method not found: resources/read");
+            return error_frame_kinded(
+                id,
+                METHOD_NOT_FOUND,
+                "Method not found: resources/read",
+                Some(kinds::INVALID_INPUT),
+                None,
+            );
         };
         let uri = message
             .get("params")
@@ -600,10 +633,22 @@ impl McpServer {
             .and_then(Value::as_str);
         let uri = match uri {
             Some(uri) if !uri.trim().is_empty() => uri,
-            _ => return error_frame(id, INVALID_PARAMS, "Missing resource uri in params"),
+            _ => {
+                return error_frame_kinded(
+                    id,
+                    INVALID_PARAMS,
+                    "Missing resource uri in params",
+                    Some(kinds::INVALID_INPUT),
+                    None,
+                )
+            }
         };
         match crate::resources::read(provider, &self.config.context, uri) {
             Ok(value) => result_frame(id, value),
+            // Deliberately untagged: a provider returns an opaque string, so
+            // this could be a bad URI, a missing dependency, or a provider
+            // defect. Guessing `invalid_input` would blame the caller for a
+            // failure the library cannot classify (ERR-01 review).
             Err(message) => error_frame(id, INVALID_PARAMS, &message),
         }
     }
@@ -637,11 +682,27 @@ impl McpServer {
         let params = message.get("params");
         let name = match params.and_then(|p| p.get("name")).and_then(Value::as_str) {
             Some(name) => name,
-            None => return error_frame(id, INVALID_PARAMS, "Missing tool name in params"),
+            None => {
+                return error_frame_kinded(
+                    id,
+                    INVALID_PARAMS,
+                    "Missing tool name in params",
+                    Some(kinds::INVALID_INPUT),
+                    None,
+                )
+            }
         };
         let tool = match self.config.registry.get(name) {
             Some(tool) => tool.clone(),
-            None => return error_frame(id, INVALID_PARAMS, &format!("Unknown tool: {name}")),
+            None => {
+                return error_frame_kinded(
+                    id,
+                    INVALID_PARAMS,
+                    &format!("Unknown tool: {name}"),
+                    Some(kinds::INVALID_INPUT),
+                    Some(&json!({ "tool": name })),
+                )
+            }
         };
         let args = params
             .and_then(|p| p.get("arguments"))
@@ -660,13 +721,15 @@ impl McpServer {
         let handled = match outcome {
             Ok(handled) => handled,
             Err(payload) => {
-                return error_frame(
+                return error_frame_kinded(
                     id,
                     INTERNAL_ERROR,
                     &format!(
                         "Tool '{name}' panicked while executing: {}",
                         crate::types::panic_message(payload.as_ref())
                     ),
+                    Some(kinds::INTERNAL),
+                    Some(&json!({ "tool": name })),
                 )
             }
         };
@@ -681,7 +744,7 @@ impl McpServer {
                 }
                 result_frame(id, tool_ok(value))
             }
-            Err(error) => error_frame(id, error.code, &error.message),
+            Err(error) => crate::response::error_frame_for(id, &error),
         }
     }
 
@@ -899,13 +962,15 @@ fn handle_line_contained(
         server.handle_line_maybe_remote(line, owner)
     }))
     .unwrap_or_else(|payload| {
-        Some(error_frame(
+        Some(error_frame_kinded(
             request_id(line),
             INTERNAL_ERROR,
             &format!(
                 "Internal error: request handling panicked: {}",
                 crate::types::panic_message(payload.as_ref())
             ),
+            Some(kinds::INTERNAL),
+            None,
         ))
     })
 }
@@ -1666,5 +1731,171 @@ mod tests {
             1,
             "owner must apply exactly once — no recover/re-send on ResponseLost"
         );
+    }
+
+    // ---- ERR-01 (DEC-04): structured failure kinds over the real stdio surface ----
+
+    /// A handler's own refusal keeps its JSON-RPC code and gains a machine-readable
+    /// kind, so a log or recovery routine can tell a refusal from a malfunction
+    /// without parsing the sentence.
+    #[test]
+    fn a_handler_refusal_carries_its_kind_in_the_error_data() {
+        let server = McpServer::new(ServerConfig::new("todo", "0.1.0", ".").tool(ToolSpec::read(
+            "todo_show",
+            "Show",
+            json!({ "type": "object", "properties": {} }),
+            |_ctx, _args| {
+                Err(
+                    crate::types::ToolError::invalid_params("id must be a string")
+                        .with_kind(kinds::INVALID_INPUT)
+                        .with_data(json!({ "field": "id" })),
+                )
+            },
+        )));
+        let raw = server
+            .handle_line(
+                &json!({
+                    "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                    "params": { "name": "todo_show", "arguments": {} }
+                })
+                .to_string(),
+            )
+            .expect("a request must produce a frame");
+        let frame: Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(frame["error"]["code"], crate::types::INVALID_PARAMS);
+        assert_eq!(frame["error"]["data"]["kind"], kinds::INVALID_INPUT);
+        assert_eq!(frame["error"]["data"]["field"], "id");
+    }
+
+    /// The addition is non-breaking: an untagged error serializes byte-identically
+    /// to what it produced before kinds existed — no `data` member at all.
+    #[test]
+    fn an_untagged_error_serializes_exactly_as_before() {
+        let server = McpServer::new(ServerConfig::new("todo", "0.1.0", ".").tool(ToolSpec::read(
+            "todo_show",
+            "Show",
+            json!({ "type": "object", "properties": {} }),
+            |_ctx, _args| Err(crate::types::ToolError::invalid_params("nope")),
+        )));
+        let raw = server
+            .handle_line(
+                &json!({
+                    "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                    "params": { "name": "todo_show", "arguments": {} }
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            raw,
+            crate::response::error_frame(json!(8), crate::types::INVALID_PARAMS, "nope"),
+            "an untagged error must be wire-identical to the pre-ERR-01 frame"
+        );
+        let frame: Value = serde_json::from_str(&raw).unwrap();
+        assert!(frame["error"].get("data").is_none());
+    }
+
+    /// A live-but-unreachable owner is infrastructure, not a refusal: same code as
+    /// today, now distinguishable from every ordinary rejection in the same log.
+    #[test]
+    fn an_unreachable_owner_is_classified_owner_unhealthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar =
+            SidecarConfig::new("todo", dir.path(), dir.path().join("cache")).app_version("0.1.0");
+        let unreachable = crate::sidecar::test_support::unreachable_endpoint(&sidecar);
+        let server = McpServer::new(
+            ServerConfig::new("todo", "0.1.0", dir.path())
+                .sidecar(sidecar)
+                .tool(ToolSpec::write(
+                    "todo_create",
+                    "Create",
+                    json!({ "type": "object", "properties": {} }),
+                    |_ctx, _args| Ok(json!({ "created": true })),
+                )),
+        );
+        let raw = server
+            .handle_line_with_owner(
+                &json!({
+                    "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                    "params": { "name": "todo_create", "arguments": {} }
+                })
+                .to_string(),
+                Some(&unreachable),
+            )
+            .expect("must produce a fail-closed frame");
+        let frame: Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(frame["error"]["code"], OWNER_SERVICE_UNAVAILABLE);
+        assert_eq!(frame["error"]["data"]["kind"], kinds::OWNER_UNHEALTHY);
+        assert_eq!(frame["error"]["data"]["retry_safe"], true);
+    }
+
+    /// The dangerous case: the request was flushed and may already be committed.
+    /// It must be classified outcome-unknown and explicitly NOT retry-safe, since
+    /// a blind retry is the double-apply path (FIX-169).
+    #[test]
+    fn an_ambiguous_commit_is_classified_outcome_unknown_and_not_retry_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar =
+            SidecarConfig::new("todo", dir.path(), dir.path().join("cache")).app_version("0.1.0");
+        let owner = crate::sidecar::test_support::start_owner_thread_drop_response(
+            sidecar.clone(),
+            |_line| {
+                Some(
+                    r#"{"jsonrpc":"2.0","id":10,"result":{"structuredContent":{"created":true}}}"#
+                        .to_string(),
+                )
+            },
+        )
+        .expect("drop-response owner");
+        crate::sidecar::test_support::write_endpoint(&sidecar, &owner);
+
+        let server = McpServer::new(
+            ServerConfig::new("todo", "0.1.0", dir.path())
+                .sidecar(sidecar)
+                .tool(ToolSpec::write(
+                    "todo_create",
+                    "Create",
+                    json!({ "type": "object", "properties": {} }),
+                    |_ctx, _args| Ok(json!({ "created": true })),
+                )),
+        );
+        let raw = server
+            .handle_line_with_owner(
+                &json!({
+                    "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                    "params": { "name": "todo_create", "arguments": {} }
+                })
+                .to_string(),
+                Some(&owner),
+            )
+            .expect("must produce a frame");
+        let frame: Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(frame["error"]["code"], OWNER_SERVICE_UNAVAILABLE);
+        assert_eq!(frame["error"]["data"]["kind"], kinds::OUTCOME_UNKNOWN);
+        assert_eq!(frame["error"]["data"]["retry_safe"], false);
+    }
+
+    /// An unknown tool is caller error, and the frame names which tool — the kind
+    /// makes it countable, the data makes it actionable.
+    #[test]
+    fn an_unknown_tool_is_classified_invalid_input() {
+        let server = McpServer::new(ServerConfig::new("todo", "0.1.0", "."));
+        let raw = server
+            .handle_line(
+                &json!({
+                    "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                    "params": { "name": "todo_nope", "arguments": {} }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let frame: Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(frame["error"]["data"]["kind"], kinds::INVALID_INPUT);
+        assert_eq!(frame["error"]["data"]["tool"], "todo_nope");
     }
 }

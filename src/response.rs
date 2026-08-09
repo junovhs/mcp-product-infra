@@ -36,6 +36,39 @@ pub fn error_frame(id: Value, code: i64, message: &str) -> String {
     .to_string()
 }
 
+/// `error_frame` plus DEC-04 classification: the stable `kind` and any
+/// structured details ride in the JSON-RPC `data` member, the slot the spec
+/// reserves for exactly this. An error carrying neither produces the same
+/// bytes as [`error_frame`], so tagging is strictly additive.
+pub fn error_frame_kinded(
+    id: Value,
+    code: i64,
+    message: &str,
+    kind: Option<&str>,
+    data: Option<&Value>,
+) -> String {
+    let error = crate::types::ToolError {
+        code,
+        message: message.to_string(),
+        kind: kind.map(str::to_string),
+        data: data.cloned(),
+    };
+    error_frame_for(id, &error)
+}
+
+/// Render a [`ToolError`](crate::types::ToolError) as its JSON-RPC error frame.
+pub fn error_frame_for(id: Value, error: &crate::types::ToolError) -> String {
+    let Some(data) = error.error_data() else {
+        return error_frame(id, error.code, &error.message);
+    };
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": error.code, "message": error.message, "data": data }
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -65,6 +65,13 @@ pub struct HandlerResponse {
     pub code: Option<i64>,
     #[serde(default)]
     pub message: Option<String>,
+    /// DEC-04: stable machine-readable failure classification, so a handler in
+    /// any language can say *what kind* of failure this is, not just its code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Structured failure details carried alongside the kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 impl HandlerResponse {
@@ -74,6 +81,8 @@ impl HandlerResponse {
             result: Some(result),
             code: None,
             message: None,
+            kind: None,
+            data: None,
         }
     }
 
@@ -83,6 +92,38 @@ impl HandlerResponse {
             result: None,
             code: Some(code),
             message: Some(message.into()),
+            kind: None,
+            data: None,
         }
+    }
+
+    /// `error` plus its DEC-04 classification.
+    pub fn error_kinded(code: i64, message: impl Into<String>, kind: impl Into<String>) -> Self {
+        Self {
+            kind: Some(kind.into()),
+            ..Self::error(code, message)
+        }
+    }
+
+    /// Attach structured details to a failure response.
+    pub fn with_data(mut self, data: Value) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// The typed failure this response describes, or `None` when it is a success.
+    pub fn as_tool_error(&self) -> Option<crate::types::ToolError> {
+        if self.ok {
+            return None;
+        }
+        Some(crate::types::ToolError {
+            code: self.code.unwrap_or(crate::types::SERVER_ERROR),
+            message: self
+                .message
+                .clone()
+                .unwrap_or_else(|| "handler failed".to_string()),
+            kind: self.kind.clone(),
+            data: self.data.clone(),
+        })
     }
 }

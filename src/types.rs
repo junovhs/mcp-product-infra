@@ -38,11 +38,50 @@ impl ToolContext {
     }
 }
 
+/// Stable failure kinds the library itself raises (DEC-04). These are strings,
+/// not an enum, precisely so an app can add its own vocabulary without waiting
+/// for a release here — infrastructure never learns what an app's dependencies
+/// are. Consumers branch on the kind; the JSON-RPC code stays a transport fact.
+pub mod kinds {
+    /// The caller's arguments are wrong: missing, malformed, or unknown.
+    pub const INVALID_INPUT: &str = "invalid_input";
+    /// The request is well-formed but the world is not in a state that allows it.
+    pub const PRECONDITION: &str = "precondition";
+    /// A deliberate, correct refusal by policy — not a malfunction.
+    pub const POLICY_REFUSAL: &str = "policy_refusal";
+    /// Something the call depends on is absent; it may be repairable.
+    pub const DEPENDENCY_UNAVAILABLE: &str = "dependency_unavailable";
+    /// A dependency exists but is behind the state it should describe.
+    pub const DEPENDENCY_STALE: &str = "dependency_stale";
+    /// The work is legitimate but the resource is occupied; retry later.
+    pub const BUSY: &str = "busy";
+    /// A bounded wait elapsed without an answer.
+    pub const TIMEOUT: &str = "timeout";
+    /// The resident owner is registered but not serving correctly.
+    pub const OWNER_UNHEALTHY: &str = "owner_unhealthy";
+    /// The channel to the owner failed before the request was delivered.
+    pub const TRANSPORT_FAILURE: &str = "transport_failure";
+    /// A defect in this process — a panic or a violated internal invariant.
+    pub const INTERNAL: &str = "internal";
+    /// The request may or may not have been applied; the caller must verify
+    /// before retrying, because a retry could double-apply it.
+    pub const OUTCOME_UNKNOWN: &str = "outcome_unknown";
+}
+
 /// A typed tool failure that becomes a JSON-RPC error.
+///
+/// `code` stays protocol vocabulary; `kind` carries the meaning a caller can
+/// branch on, and `data` carries structured details (DEC-04). Both are optional
+/// and additive: an error with neither serializes exactly as it did before they
+/// existed, so untagged app errors are unchanged on the wire.
 #[derive(Clone, Debug)]
 pub struct ToolError {
     pub code: i64,
     pub message: String,
+    /// Stable machine-readable classification; see [`kinds`].
+    pub kind: Option<String>,
+    /// Structured details for the caller, merged into the JSON-RPC `data` member.
+    pub data: Option<Value>,
 }
 
 impl ToolError {
@@ -50,6 +89,8 @@ impl ToolError {
         Self {
             code,
             message: message.into(),
+            kind: None,
+            data: None,
         }
     }
 
@@ -59,6 +100,49 @@ impl ToolError {
 
     pub fn server(message: impl Into<String>) -> Self {
         Self::new(SERVER_ERROR, message)
+    }
+
+    /// Tag this failure with a stable kind (one of [`kinds`], or an app's own).
+    pub fn with_kind(mut self, kind: impl Into<String>) -> Self {
+        self.kind = Some(kind.into());
+        self
+    }
+
+    /// Attach structured details the caller can read without parsing prose.
+    pub fn with_data(mut self, data: Value) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// The JSON-RPC `data` member for this failure, or `None` when it carries
+    /// neither a kind nor details — which keeps an untagged error byte-identical
+    /// to what it serialized to before kinds existed.
+    pub fn error_data(&self) -> Option<Value> {
+        match (&self.kind, &self.data) {
+            (None, None) => None,
+            (kind, data) => {
+                let mut object = serde_json::Map::new();
+                match data {
+                    // An object payload merges in flat, so details sit beside
+                    // `kind` instead of nesting a redundant wrapper.
+                    Some(Value::Object(fields)) => {
+                        for (key, value) in fields {
+                            object.insert(key.clone(), value.clone());
+                        }
+                    }
+                    Some(other) => {
+                        object.insert("details".to_string(), other.clone());
+                    }
+                    None => {}
+                }
+                // `kind` is reserved: stamped last so app details can never
+                // shadow the classification a caller branches on.
+                if let Some(kind) = kind {
+                    object.insert("kind".to_string(), Value::String(kind.clone()));
+                }
+                Some(Value::Object(object))
+            }
+        }
     }
 }
 
@@ -155,5 +239,42 @@ impl ToolSpec {
             handler: Arc::new(handler),
             annotations: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod error_data_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// ERR-01 review: `kind` is the member every caller branches on, so app
+    /// details must never be able to shadow it.
+    #[test]
+    fn structured_details_cannot_overwrite_the_reserved_kind_member() {
+        let error = ToolError::server("boom")
+            .with_kind(kinds::INTERNAL)
+            .with_data(json!({ "kind": "invalid_input", "attempt": 2 }));
+        let data = error.error_data().expect("a tagged error carries data");
+
+        assert_eq!(data["kind"], kinds::INTERNAL);
+        assert_eq!(data["attempt"], 2);
+    }
+
+    /// A non-object payload is nested rather than dropped or splatted.
+    #[test]
+    fn a_non_object_detail_payload_is_nested_under_details() {
+        let error = ToolError::server("boom")
+            .with_kind(kinds::BUSY)
+            .with_data(json!(["a", "b"]));
+        let data = error.error_data().unwrap();
+
+        assert_eq!(data["kind"], kinds::BUSY);
+        assert_eq!(data["details"], json!(["a", "b"]));
+    }
+
+    /// The non-breaking guarantee at its source: no kind, no details, no data.
+    #[test]
+    fn an_untagged_error_has_no_data_member() {
+        assert!(ToolError::invalid_params("nope").error_data().is_none());
     }
 }
