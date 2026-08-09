@@ -136,6 +136,8 @@ pub struct OwnerHealth {
 }
 
 impl OwnerHealth {
+    /// The app reports its state usable. Needs no detail: "working" is not a
+    /// diagnosis anyone has to read.
     pub fn ready() -> Self {
         Self {
             state: OwnerHealthState::Ready,
@@ -143,6 +145,9 @@ impl OwnerHealth {
         }
     }
 
+    /// The app reports its own state broken, in its own words. `detail` is
+    /// required because this verdict is what a human acts on — name the handle,
+    /// the query, or the invariant that went bad, not "error".
     pub fn unhealthy(detail: impl Into<String>) -> Self {
         Self {
             state: OwnerHealthState::Unhealthy,
@@ -150,6 +155,11 @@ impl OwnerHealth {
         }
     }
 
+    /// No competent opinion is available — say why in `detail`. An app rarely
+    /// needs this: infrastructure already answers `Unknown` for a missing,
+    /// panicking, or hanging hook. Use it when the app itself cannot tell yet
+    /// (still starting, health probe unavailable) — never as a soft way to say
+    /// unhealthy, since callers treat `Unknown` as "no evidence of trouble".
     pub fn unknown(detail: impl Into<String>) -> Self {
         Self {
             state: OwnerHealthState::Unknown,
