@@ -22,6 +22,7 @@
 //!   (fail closed); only a genuinely dead one is cleared and re-elected.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -67,6 +68,29 @@ const HEALTH_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// the documented `Unknown` verdict rather than a client-side transport error —
 /// "your health hook is stuck" is a far better answer than silence.
 const HEALTH_HOOK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often a client re-asks a given owner runtime how it is (OWN-02).
+///
+/// Retirement is evaluated at call boundaries, never by a monitor thread — but
+/// "at every call boundary" is not the same as "on every call". A burst of
+/// twenty tool calls does not need twenty round trips to learn the same fact,
+/// and the healthy path is the one that must not get slower. Within this window
+/// a call reuses the last verdict for the same generation; a fresh generation
+/// (a replacement owner) is always probed on its first call.
+const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The window over which automatic retirements are counted (DEC-06).
+const RETIREMENT_WINDOW: Duration = Duration::from_secs(600);
+
+/// How many automatic retirements may happen per workspace per
+/// [`RETIREMENT_WINDOW`] before infrastructure stops trying (DEC-06).
+///
+/// The bound is the safety property, not the number. An app that is unhealthy
+/// on every startup must degrade to a legible terminal error, never to a
+/// restart loop — three attempts is enough to clear a one-off wedge (the
+/// motivating incident) and few enough that a permanently sick app stops
+/// spawning processes almost immediately.
+const RETIREMENT_BOUND: usize = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OwnerEndpoint {
@@ -801,6 +825,317 @@ pub fn query_owner_health(
     Ok(report)
 }
 
+/// Identity of an owner runtime that was automatically retired (DEC-06).
+///
+/// Carried out of [`enforce_owner_health`] so the retirement can be reported
+/// rather than inferred: a restart that leaves no record is indistinguishable
+/// from the wedge it replaced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetiredOwner {
+    pub pid: u32,
+    pub fingerprint: String,
+    pub generation: String,
+    /// The app's own words for why it was unhealthy.
+    pub detail: Option<String>,
+}
+
+impl std::fmt::Display for RetiredOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pid {} generation {} build {}",
+            self.pid,
+            if self.generation.is_empty() {
+                "<none>"
+            } else {
+                &self.generation
+            },
+            if self.fingerprint.is_empty() {
+                "<none>"
+            } else {
+                &self.fingerprint
+            },
+        )?;
+        if let Some(detail) = &self.detail {
+            write!(f, ": {detail}")?;
+        }
+        Ok(())
+    }
+}
+
+/// What a call boundary should do about the owner it is about to use (OWN-02).
+#[derive(Clone, Debug)]
+pub enum OwnerHealthAction {
+    /// Nothing said this owner is sick — dispatch against it as before. This is
+    /// the answer for a `Ready` verdict, an `Unknown` one, a probe that was
+    /// throttled, an app with no health hook at all, and an owner that could not
+    /// be reached (transport evidence belongs to `recover_owner`, not here).
+    Proceed,
+    /// The owner reported itself unhealthy and has been retired and replaced.
+    /// Dispatch against `replacement`.
+    Retired {
+        replacement: OwnerEndpoint,
+        retired: RetiredOwner,
+    },
+    /// The owner reported itself unhealthy and the retirement bound for this
+    /// window is spent. Infrastructure stops trying; the call fails with an
+    /// `owner_unhealthy` kind. Retrying will not help until the window rolls
+    /// over or a human fixes the application.
+    Exhausted {
+        unhealthy: RetiredOwner,
+        attempts: usize,
+        window: Duration,
+    },
+    /// The owner reported itself unhealthy, retirement was permitted, and no
+    /// replacement could be seated. The call fails, but retrying is reasonable.
+    ReplacementFailed {
+        unhealthy: RetiredOwner,
+        error: String,
+    },
+}
+
+/// Decide, at a call boundary, whether the owner about to be used is fit to
+/// serve — and if the app says it is not, retire it and seat a replacement
+/// (DEC-06).
+///
+/// The whole mechanism hangs off one rule from DEC-03: **only the app's health
+/// hook may say an owner is unhealthy.** Infrastructure never infers it. A tool
+/// that legitimately refuses, a handler that errors, a request that times out,
+/// a socket that resets — none of those reach this function's verdict. That is
+/// deliberate: retiring an owner because a handler returned an error would
+/// churn the single writer for reasons infrastructure cannot understand, and
+/// would destroy unrelated in-flight work every time a user typo'd an argument.
+///
+/// Three properties keep automatic retirement safe rather than reckless:
+///
+///  - **Drained, not cut.** Retirement goes through the same `owner/shutdown`
+///    choreography as a stale-build handoff: the owner stops accepting, lets
+///    in-flight responses flush, runs the app's drain hook, and exits. DEC-05
+///    forbids cutting a running mutation, and that binds retirement exactly as
+///    it binds client cancellation.
+///  - **Bounded.** At most [`RETIREMENT_BOUND`] retirements per workspace per
+///    [`RETIREMENT_WINDOW`], counted in a file so the bound survives the client
+///    process — a fresh MCP session must not reset a sick app's budget, or
+///    "bounded" means nothing to the agent that keeps reconnecting.
+///  - **Never silent.** Every outcome names the retired runtime's pid,
+///    fingerprint, and generation.
+///
+/// Only three of the five owner states can be answered here. Process liveness
+/// and transport reachability are `recover_owner`'s job and are deliberately
+/// left alone: an owner that does not answer the health query is not declared
+/// unhealthy, because "did not answer" is transport evidence, and treating it
+/// as an application verdict would let a slow machine retire healthy owners.
+pub fn enforce_owner_health(config: &SidecarConfig, endpoint: &OwnerEndpoint) -> OwnerHealthAction {
+    let unhealthy = match probe_gate(config, endpoint) {
+        ProbeGate::Skip => return OwnerHealthAction::Proceed,
+        // Already known sick and not replaceable — see `probe_gate`.
+        ProbeGate::KnownUnhealthy(unhealthy) => unhealthy,
+        ProbeGate::Probe => {
+            let Ok(report) = query_owner_health(endpoint) else {
+                // Unreachable, too old to know `owner/health`, or answering
+                // something that did not come from the control plane. None of
+                // those is the app saying it is broken (DEC-03), so none of
+                // them retires anything.
+                return OwnerHealthAction::Proceed;
+            };
+            if report.state != OwnerHealthState::Unhealthy {
+                return OwnerHealthAction::Proceed;
+            }
+            let unhealthy = RetiredOwner {
+                pid: report.pid,
+                fingerprint: report.fingerprint.clone(),
+                generation: report.generation.clone(),
+                detail: report.detail.clone(),
+            };
+            remember_verdict(config, endpoint, Some(unhealthy.clone()));
+            unhealthy
+        }
+    };
+
+    match claim_retirement(config, &unhealthy) {
+        RetirementBudget::Spent { attempts } => OwnerHealthAction::Exhausted {
+            unhealthy,
+            attempts,
+            window: RETIREMENT_WINDOW,
+        },
+        RetirementBudget::Claimed => {
+            retire_stale_owner(endpoint);
+            match ensure_owner_process(config) {
+                // Confirm the runtime actually changed. After a retirement the
+                // old listener can briefly keep answering, so "the endpoint
+                // responded" does not prove the new runtime is serving —
+                // generation identity is the only thing that does.
+                Ok(replacement) if replacement.generation != endpoint.generation => {
+                    OwnerHealthAction::Retired {
+                        replacement,
+                        retired: unhealthy,
+                    }
+                }
+                Ok(_) => OwnerHealthAction::ReplacementFailed {
+                    unhealthy,
+                    error: "the same owner runtime is still registered after retirement"
+                        .to_string(),
+                },
+                Err(error) => OwnerHealthAction::ReplacementFailed { unhealthy, error },
+            }
+        }
+    }
+}
+
+enum ProbeGate {
+    /// Ask the owner how it is.
+    Probe,
+    /// A recent probe found nothing wrong; do not ask again yet.
+    Skip,
+    /// A recent probe found this exact runtime unhealthy and it is still the
+    /// one registered. Retirement either already failed or was refused by the
+    /// bound, because a successful one mints a new generation and therefore a
+    /// new memo key. Re-deciding without re-probing keeps a terminal verdict
+    /// terminal: without this, the call right after "stop trying" would find
+    /// the probe throttled, read `Proceed`, and dispatch into the wedged owner
+    /// the previous call just refused to use.
+    KnownUnhealthy(RetiredOwner),
+}
+
+/// One entry per owner runtime this client has asked about: when it asked, and
+/// what it learned (`None` = nothing wrong).
+type HealthMemo = std::sync::Mutex<HashMap<String, (Instant, Option<RetiredOwner>)>>;
+
+static HEALTH_MEMO: std::sync::OnceLock<HealthMemo> = std::sync::OnceLock::new();
+
+fn memo_key(config: &SidecarConfig, endpoint: &OwnerEndpoint) -> String {
+    format!(
+        "{}|{}",
+        config.endpoint_path().display(),
+        endpoint.generation
+    )
+}
+
+fn lock_memo() -> std::sync::MutexGuard<'static, HashMap<String, (Instant, Option<RetiredOwner>)>> {
+    match HEALTH_MEMO
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+    {
+        Ok(guard) => guard,
+        // A poisoned memo means some other thread panicked mid-probe. The memo
+        // is a cache of a re-derivable fact, so recovering and continuing is
+        // strictly better than either panicking here or never checking health
+        // again for the rest of the process's life.
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Decide whether this call boundary needs to ask the owner how it is.
+///
+/// Claims the probe slot as it answers `Probe`, so a burst of concurrent
+/// dispatch threads produces one query rather than one each. The claim is
+/// optimistic — it records "nothing wrong" until the probe says otherwise — so
+/// a thread that races inside that window dispatches against an owner later
+/// found sick. That call gets the application's own error, which is honest, and
+/// the next boundary retires the owner.
+fn probe_gate(config: &SidecarConfig, endpoint: &OwnerEndpoint) -> ProbeGate {
+    let key = memo_key(config, endpoint);
+    let mut memo = lock_memo();
+    let now = Instant::now();
+    match memo.get(&key) {
+        Some((at, verdict)) if now.duration_since(*at) < HEALTH_PROBE_INTERVAL => match verdict {
+            Some(unhealthy) => ProbeGate::KnownUnhealthy(unhealthy.clone()),
+            None => ProbeGate::Skip,
+        },
+        _ => {
+            memo.insert(key, (now, None));
+            ProbeGate::Probe
+        }
+    }
+}
+
+fn remember_verdict(
+    config: &SidecarConfig,
+    endpoint: &OwnerEndpoint,
+    verdict: Option<RetiredOwner>,
+) {
+    lock_memo().insert(memo_key(config, endpoint), (Instant::now(), verdict));
+}
+
+enum RetirementBudget {
+    Claimed,
+    Spent { attempts: usize },
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+struct RetirementLedger {
+    #[serde(default)]
+    retirements: Vec<RetirementRecord>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct RetirementRecord {
+    at_unix: u64,
+    pid: u32,
+    generation: String,
+}
+
+/// Take one retirement from this workspace's budget, or report it spent.
+///
+/// The ledger is a file, not process state, because the failure this bounds is
+/// an app that is unhealthy at every startup — and a client that reconnects
+/// (a new agent session against the same workspace) would otherwise arrive with
+/// a fresh budget and resume the loop.
+///
+/// The two failure directions are not symmetric, so they are handled
+/// differently. An unreadable ledger is treated as empty: the worst case is a
+/// few extra retirements. A ledger that cannot be *written* refuses the
+/// retirement outright — if the count cannot be recorded it cannot grow, and
+/// "retire without being able to count" is exactly the unbounded loop this
+/// exists to prevent.
+fn claim_retirement(config: &SidecarConfig, unhealthy: &RetiredOwner) -> RetirementBudget {
+    let path = retirement_ledger_path(config);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let horizon = now.saturating_sub(RETIREMENT_WINDOW.as_secs());
+
+    let mut ledger: RetirementLedger = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    // Drop everything older than the window, and anything stamped in the future
+    // (a clock that jumped backwards must not freeze the budget indefinitely).
+    ledger
+        .retirements
+        .retain(|record| record.at_unix >= horizon && record.at_unix <= now);
+
+    if ledger.retirements.len() >= RETIREMENT_BOUND {
+        return RetirementBudget::Spent {
+            attempts: ledger.retirements.len(),
+        };
+    }
+
+    ledger.retirements.push(RetirementRecord {
+        at_unix: now,
+        pid: unhealthy.pid,
+        generation: unhealthy.generation.clone(),
+    });
+    let attempts = ledger.retirements.len();
+    let wrote = serde_json::to_string(&ledger)
+        .map_err(|e| e.to_string())
+        .and_then(|raw| {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::write(&path, raw).map_err(|e| e.to_string())
+        });
+    match wrote {
+        Ok(()) => RetirementBudget::Claimed,
+        Err(_) => RetirementBudget::Spent { attempts },
+    }
+}
+
+fn retirement_ledger_path(config: &SidecarConfig) -> PathBuf {
+    config.cache_dir.join("mcp-owner-retirements.json")
+}
+
 fn handle_owner_stream(
     config: &SidecarConfig,
     token: &str,
@@ -1404,10 +1739,17 @@ pub mod test_support {
             .map_err(|e| format!("failed to read MCP owner request: {e}"))?;
         let request: OwnerRequest = serde_json::from_str(raw.trim_end())
             .map_err(|e| format!("malformed MCP owner request: {e}"))?;
-        if request.token == token
-            && super::line_method(&request.line).as_deref() == Some("owner/shutdown")
-        {
-            // Still honor shutdown; tests that drop replies are about tool calls.
+        // Control-plane methods are never application calls. A real owner
+        // answers `owner/shutdown` and `owner/health` in `handle_owner_stream`
+        // ahead of MCP dispatch, so letting them reach the handler here would
+        // make this stand-in count a health probe as a tool invocation — and
+        // these tests exist to count invocations exactly. The reply is still
+        // dropped, which is precisely what this owner is simulating.
+        let control_plane = matches!(
+            super::line_method(&request.line).as_deref(),
+            Some("owner/shutdown") | Some("owner/health")
+        );
+        if request.token == token && control_plane {
             let _ = config;
             return Ok(());
         }

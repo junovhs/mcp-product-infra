@@ -96,6 +96,32 @@ impl OwnerProse {
         )
     }
 
+    /// OWN-02: the app reported itself unhealthy more times than automatic
+    /// retirement is allowed to answer for. Nothing infrastructure can do will
+    /// fix this, so the message must not invite a retry that cannot work — it
+    /// names the app's own diagnosis and hands the problem to a human.
+    fn unhealthy_exhausted(
+        &self,
+        detail: Option<&str>,
+        attempts: usize,
+        window: std::time::Duration,
+    ) -> String {
+        let diagnosis = match detail {
+            Some(detail) => format!(" It reports: {detail}."),
+            None => String::new(),
+        };
+        format!(
+            "{} The {} reports its own state unusable.{diagnosis} It has been replaced \
+             automatically {attempts} time(s) in the last {} minute(s) and came back unhealthy, \
+             so no further automatic replacement will be attempted. {}, and check the \
+             application's own health before retrying.",
+            self.prefix,
+            self.owner_noun,
+            (window.as_secs() / 60).max(1),
+            self.restart_hint,
+        )
+    }
+
     /// FIX-169: request was delivered; the mutation may already be committed.
     /// Must not claim "write refused" and must not invite a blind retry.
     fn ambiguous_commit(&self, error: &str) -> String {
@@ -524,6 +550,68 @@ impl McpServer {
         };
 
         let prose = &self.config.owner_prose;
+
+        // OWN-02 / DEC-06: before using the resident owner, honor the app's own
+        // verdict on whether it can serve. An owner its health hook reports
+        // unhealthy is retired here — drained, bounded, and reported — so a
+        // wedge that used to halt an agent until a human killed the process
+        // instead costs one replacement and the call proceeds. Nothing else may
+        // trigger this: a handler error, a refusal, or a transport failure
+        // reaches the paths below unchanged (DEC-03).
+        let health = sidecar::enforce_owner_health(sidecar_config, owner);
+        let owner = match &health {
+            sidecar::OwnerHealthAction::Proceed => owner,
+            sidecar::OwnerHealthAction::Retired {
+                replacement,
+                retired,
+            } => {
+                eprintln!(
+                    "{} mcp: retired unhealthy resident owner ({retired}); \
+                     replacement generation {}",
+                    self.config.app_name, replacement.generation
+                );
+                replacement
+            }
+            // The bound is spent: the app has been unhealthy repeatedly, so
+            // replacing the process again would be a restart loop, not a
+            // recovery. Stop, and say so in terms a human can act on — this is
+            // the one honest answer left, and it is still far better than the
+            // silent halt it replaces.
+            sidecar::OwnerHealthAction::Exhausted {
+                unhealthy,
+                attempts,
+                window,
+            } => {
+                eprintln!(
+                    "{} mcp: resident owner unhealthy ({unhealthy}); \
+                     {attempts} automatic retirements in the last {}s — not retrying",
+                    self.config.app_name,
+                    window.as_secs()
+                );
+                return Some(error_frame_kinded(
+                    request_id(line),
+                    prose.code,
+                    &prose.unhealthy_exhausted(unhealthy.detail.as_deref(), *attempts, *window),
+                    Some(kinds::OWNER_UNHEALTHY),
+                    Some(&json!({ "retry_safe": false })),
+                ));
+            }
+            sidecar::OwnerHealthAction::ReplacementFailed { unhealthy, error } => {
+                eprintln!(
+                    "{} mcp: resident owner unhealthy ({unhealthy}); \
+                     no replacement could be elected: {error}",
+                    self.config.app_name
+                );
+                return Some(error_frame_kinded(
+                    request_id(line),
+                    prose.code,
+                    &prose.down(error),
+                    Some(kinds::OWNER_UNHEALTHY),
+                    Some(&json!({ "retry_safe": true })),
+                ));
+            }
+        };
+
         match sidecar::send_line(owner, line) {
             Ok(response) => response,
             // FIX-169: the request left the client; the owner may already have
