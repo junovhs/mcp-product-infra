@@ -58,6 +58,38 @@ pub type BeforeToolHook = Arc<
         + 'static,
 >;
 
+/// Where a completed tool call was executed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DispatchLocation {
+    Local,
+    ResidentOwner,
+}
+
+/// The outcome of a completed tool call. Failure kinds are the stable
+/// machine-readable values from JSON-RPC `error.data.kind` (DEC-04).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DispatchOutcome {
+    Success,
+    Failure { kind: Option<String> },
+}
+
+/// Timing and routing facts for one completed `tools/call` request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DispatchRecord {
+    pub tool_name: String,
+    pub mutating: bool,
+    pub execution: ExecutionPolicy,
+    pub queue_wait: Duration,
+    pub handler_duration: Option<Duration>,
+    pub owner_round_trip: Option<Duration>,
+    pub total: Duration,
+    pub outcome: DispatchOutcome,
+    pub location: DispatchLocation,
+    pub owner_generation: Option<String>,
+}
+
+pub type DispatchHook = Arc<dyn Fn(&DispatchRecord) + Send + Sync + 'static>;
+
 /// The prose (and JSON-RPC code) of the fail-closed owner-unavailable errors,
 /// so an app's agents see the app's own vocabulary ("store service", "resident
 /// store owner", the app's exact restart command) instead of generic library
@@ -158,6 +190,9 @@ pub struct ServerConfig {
     pub registry: ToolRegistry,
     pub mutation_hook: Option<MutationHook>,
     pub before_tool: Option<BeforeToolHook>,
+    /// Optional completed-call observer. It receives timing/classification
+    /// facts only; exporting, aggregation, and logging remain app concerns.
+    pub dispatch_hook: Option<DispatchHook>,
     /// When present, the server answers `resources/list` and `resources/read`
     /// from this provider's enumerated set and advertises the `resources`
     /// capability. When absent both methods stay method-not-found.
@@ -212,6 +247,7 @@ impl ServerConfig {
             registry: ToolRegistry::new(),
             mutation_hook: None,
             before_tool: None,
+            dispatch_hook: None,
             resources: None,
             sidecar: None,
             sidecar_required: true,
@@ -261,6 +297,12 @@ impl ServerConfig {
             + 'static,
     ) -> Self {
         self.before_tool = Some(Arc::new(hook));
+        self
+    }
+
+    /// Observe each completed, known `tools/call` without changing its result.
+    pub fn on_dispatch(mut self, hook: impl Fn(&DispatchRecord) + Send + Sync + 'static) -> Self {
+        self.dispatch_hook = Some(Arc::new(hook));
         self
     }
 
@@ -1023,6 +1065,27 @@ impl McpServer {
             .unwrap_or(Value::Null);
         self.config.registry.execution_policy(name, &args)
     }
+
+    fn dispatch_tool(&self, line: &str, execution: ExecutionPolicy) -> Option<DispatchTool> {
+        let message = serde_json::from_str::<Value>(line).ok()?;
+        if message.get("method").and_then(Value::as_str) != Some("tools/call")
+            || message.get("id").is_none()
+        {
+            return None;
+        }
+        let name = message.get("params")?.get("name")?.as_str()?;
+        let args = message
+            .get("params")
+            .and_then(|params| params.get("arguments"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        self.config.registry.get(name)?;
+        Some(DispatchTool {
+            name: name.to_owned(),
+            mutating: self.config.registry.mutates(name, &args),
+            execution,
+        })
+    }
 }
 
 fn request_id(line: &str) -> Value {
@@ -1158,9 +1221,21 @@ pub enum ServerEvent {
 pub struct Dispatch {
     server: McpServer,
     events_tx: mpsc::Sender<ServerEvent>,
-    mutations_tx: mpsc::Sender<String>,
-    lanes: Mutex<HashMap<String, mpsc::Sender<String>>>,
+    mutations_tx: mpsc::Sender<QueuedDispatch>,
+    lanes: Mutex<HashMap<String, mpsc::Sender<QueuedDispatch>>>,
     owner: Option<OwnerEndpoint>,
+}
+
+struct QueuedDispatch {
+    line: String,
+    queued_at: Instant,
+    tool: Option<DispatchTool>,
+}
+
+struct DispatchTool {
+    name: String,
+    mutating: bool,
+    execution: ExecutionPolicy,
 }
 
 impl Dispatch {
@@ -1169,13 +1244,13 @@ impl Dispatch {
         events_tx: mpsc::Sender<ServerEvent>,
         owner: Option<OwnerEndpoint>,
     ) -> Self {
-        let (mutations_tx, mutations_rx) = mpsc::channel::<String>();
+        let (mutations_tx, mutations_rx) = mpsc::channel::<QueuedDispatch>();
         let worker_server = server.clone();
         let worker_events = events_tx.clone();
         let worker_owner = owner.clone();
         thread::spawn(move || {
-            for line in mutations_rx {
-                let response = handle_line_contained(&worker_server, &line, worker_owner.as_ref());
+            for queued in mutations_rx {
+                let response = handle_queued(&worker_server, queued, worker_owner.as_ref());
                 let _ = worker_events.send(ServerEvent::Completed(response));
             }
         });
@@ -1189,27 +1264,33 @@ impl Dispatch {
     }
 
     pub fn dispatch(&self, line: String) {
-        match self.server.line_execution_policy(&line) {
+        let execution = self.server.line_execution_policy(&line);
+        let queued = QueuedDispatch {
+            tool: self.server.dispatch_tool(&line, execution.clone()),
+            line,
+            queued_at: Instant::now(),
+        };
+        match execution {
             ExecutionPolicy::Serialized => {
-                let _ = self.mutations_tx.send(line);
+                let _ = self.mutations_tx.send(queued);
             }
             ExecutionPolicy::Lane(lane) => {
                 let sender = self.lane_sender(lane);
-                let _ = sender.send(line);
+                let _ = sender.send(queued);
             }
             ExecutionPolicy::Concurrent => {
                 let server = self.server.clone();
                 let tx = self.events_tx.clone();
                 let owner = self.owner.clone();
                 thread::spawn(move || {
-                    let response = handle_line_contained(&server, &line, owner.as_ref());
+                    let response = handle_queued(&server, queued, owner.as_ref());
                     let _ = tx.send(ServerEvent::Completed(response));
                 });
             }
         }
     }
 
-    fn lane_sender(&self, lane: String) -> mpsc::Sender<String> {
+    fn lane_sender(&self, lane: String) -> mpsc::Sender<QueuedDispatch> {
         let mut lanes = self
             .lanes
             .lock()
@@ -1218,18 +1299,65 @@ impl Dispatch {
             return sender.clone();
         }
 
-        let (tx, rx) = mpsc::channel::<String>();
+        let (tx, rx) = mpsc::channel::<QueuedDispatch>();
         let server = self.server.clone();
         let events = self.events_tx.clone();
         let owner = self.owner.clone();
         thread::spawn(move || {
-            for line in rx {
-                let response = handle_line_contained(&server, &line, owner.as_ref());
+            for queued in rx {
+                let response = handle_queued(&server, queued, owner.as_ref());
                 let _ = events.send(ServerEvent::Completed(response));
             }
         });
         lanes.insert(lane, tx.clone());
         tx
+    }
+}
+
+fn handle_queued(
+    server: &McpServer,
+    queued: QueuedDispatch,
+    owner: Option<&OwnerEndpoint>,
+) -> Option<String> {
+    let started_at = Instant::now();
+    let queue_wait = started_at.saturating_duration_since(queued.queued_at);
+    let response = handle_line_contained(server, &queued.line, owner);
+    let finished_at = Instant::now();
+
+    if let (Some(hook), Some(tool)) = (&server.config.dispatch_hook, queued.tool) {
+        let execution_time = finished_at.saturating_duration_since(started_at);
+        let remote = owner.is_some() && server.config.sidecar.is_some();
+        hook(&DispatchRecord {
+            tool_name: tool.name,
+            mutating: tool.mutating,
+            execution: tool.execution,
+            queue_wait,
+            handler_duration: (!remote).then_some(execution_time),
+            owner_round_trip: remote.then_some(execution_time),
+            total: finished_at.saturating_duration_since(queued.queued_at),
+            outcome: dispatch_outcome(response.as_deref()),
+            location: if remote {
+                DispatchLocation::ResidentOwner
+            } else {
+                DispatchLocation::Local
+            },
+            owner_generation: owner.map(|endpoint| endpoint.generation.clone()),
+        });
+    }
+    response
+}
+
+fn dispatch_outcome(response: Option<&str>) -> DispatchOutcome {
+    let parsed = response.and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+    let Some(error) = parsed.as_ref().and_then(|value| value.get("error")) else {
+        return DispatchOutcome::Success;
+    };
+    DispatchOutcome::Failure {
+        kind: error
+            .get("data")
+            .and_then(|data| data.get("kind"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     }
 }
 
@@ -1509,6 +1637,113 @@ mod tests {
             assert_eq!(by_id[&9]["error"]["code"], INTERNAL_ERROR);
             assert_eq!(by_id[&10]["result"]["structuredContent"]["created"], true);
         });
+    }
+
+    #[test]
+    fn dispatch_hook_attributes_queue_handler_and_total_time() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let records = Arc::new(Mutex::new(Vec::<DispatchRecord>::new()));
+        let captured = Arc::clone(&records);
+        let blocker_rx = Arc::clone(&release_rx);
+        let server = McpServer::new(
+            ServerConfig::new("todo", "0.1.0", ".")
+                .on_dispatch(move |record| captured.lock().unwrap().push(record.clone()))
+                .tool(ToolSpec::write(
+                    "blocker",
+                    "Hold the serialized worker",
+                    json!({ "type": "object" }),
+                    move |_ctx, _args| {
+                        entered_tx.send(()).unwrap();
+                        blocker_rx.lock().unwrap().recv().unwrap();
+                        Ok(json!({ "done": true }))
+                    },
+                ))
+                .tool(ToolSpec::write(
+                    "slow_write",
+                    "Do measurable work",
+                    json!({ "type": "object" }),
+                    |_ctx, _args| {
+                        thread::sleep(Duration::from_millis(40));
+                        Ok(json!({ "done": true }))
+                    },
+                )),
+        );
+        let (events_tx, events_rx) = mpsc::channel();
+        let dispatch = Dispatch::new(server, events_tx, None);
+        dispatch.dispatch(call_frame(20, "blocker"));
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        dispatch.dispatch(call_frame(21, "slow_write"));
+        thread::sleep(Duration::from_millis(60));
+        release_tx.send(()).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                ServerEvent::Completed(Some(_))
+            ));
+        }
+
+        let records = records.lock().unwrap();
+        let slow = records
+            .iter()
+            .find(|record| record.tool_name == "slow_write")
+            .unwrap();
+        assert!(slow.mutating);
+        assert_eq!(slow.execution, ExecutionPolicy::Serialized);
+        assert_eq!(slow.location, DispatchLocation::Local);
+        assert_eq!(slow.owner_generation, None);
+        assert!(slow.queue_wait >= Duration::from_millis(50));
+        assert!(slow.handler_duration.unwrap() >= Duration::from_millis(35));
+        assert_eq!(slow.owner_round_trip, None);
+        assert!(slow.total >= slow.queue_wait + slow.handler_duration.unwrap());
+        assert_eq!(slow.outcome, DispatchOutcome::Success);
+    }
+
+    #[test]
+    fn dispatch_hook_carries_failure_kind() {
+        let records = Arc::new(Mutex::new(Vec::<DispatchRecord>::new()));
+        let captured = Arc::clone(&records);
+        let server = McpServer::new(
+            ServerConfig::new("todo", "0.1.0", ".")
+                .on_dispatch(move |record| captured.lock().unwrap().push(record.clone()))
+                .tool(ToolSpec::read(
+                    "fails",
+                    "Fail predictably",
+                    json!({ "type": "object" }),
+                    |_ctx, _args| {
+                        Err(crate::types::ToolError::invalid_params("bad input")
+                            .with_kind(kinds::INVALID_INPUT))
+                    },
+                )),
+        );
+        let (events_tx, events_rx) = mpsc::channel();
+        Dispatch::new(server, events_tx, None).dispatch(call_frame(22, "fails"));
+        assert!(matches!(
+            events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ServerEvent::Completed(Some(_))
+        ));
+        let records = records.lock().unwrap();
+        assert_eq!(
+            records[0].outcome,
+            DispatchOutcome::Failure {
+                kind: Some(kinds::INVALID_INPUT.to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn absent_dispatch_hook_preserves_response() {
+        let server = panicking_server(false);
+        let expected = server.handle_line(&call_frame(23, "todo_create"));
+        let (events_tx, events_rx) = mpsc::channel();
+        Dispatch::new(server, events_tx, None).dispatch(call_frame(23, "todo_create"));
+        let ServerEvent::Completed(actual) =
+            events_rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected completed response")
+        };
+        assert_eq!(actual, expected);
     }
 
     #[test]
