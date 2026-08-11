@@ -4,7 +4,7 @@
 //! Ishoo-specific capabilities and handlers were removed; the registry shape,
 //! mutation classification, and op-dispatch helper were retained.
 
-use crate::types::{Handler, ToolSpec};
+use crate::types::{ExecutionPolicy, Handler, ToolSpec};
 use serde_json::{json, Value};
 
 /// An ordered registry of tools. `tools/list` is rendered from this registry and
@@ -43,6 +43,15 @@ impl ToolRegistry {
     pub fn mutates(&self, name: &str, args: &Value) -> bool {
         self.get(name)
             .is_some_and(|tool| tool.mutation.mutates(args))
+    }
+
+    /// Scheduling policy for one call. Unknown tools remain concurrent so the
+    /// normal request path can return their protocol error without occupying a
+    /// serialized worker.
+    pub fn execution_policy(&self, name: &str, args: &Value) -> ExecutionPolicy {
+        self.get(name)
+            .map(|tool| tool.execution_policy(args))
+            .unwrap_or(ExecutionPolicy::Concurrent)
     }
 
     pub fn tools_list_result(&self) -> Value {

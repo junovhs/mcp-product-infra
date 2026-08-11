@@ -5,7 +5,7 @@
 //! - hand-written newline-delimited stdio JSON-RPC loop
 //! - `initialize`, `tools/list`, `tools/call`, `ping`, and notifications handling
 //! - structured tool responses (`content` plus `structuredContent`)
-//! - read/write dispatch split: reads run concurrently, mutations are FIFO-serialized
+//! - independent execution policies: concurrent calls, a global FIFO, or named lanes
 //! - optional resident-owner routing with fail-closed mutation recovery
 //! - shutdown drain and parent-death watchdogs
 
@@ -14,12 +14,13 @@ use crate::response::{error_frame, error_frame_kinded, result_frame, tool_ok};
 use crate::sidecar::{self, OwnerEndpoint, OwnerRecovery, SidecarConfig};
 use crate::types::kinds;
 use crate::types::{
-    ToolContext, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
-    OWNER_SERVICE_UNAVAILABLE, PARSE_ERROR,
+    ExecutionPolicy, ToolContext, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST,
+    METHOD_NOT_FOUND, OWNER_SERVICE_UNAVAILABLE, PARSE_ERROR,
 };
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -807,7 +808,13 @@ impl McpServer {
         // BUSY-01: register the call for the duration of the handler, so a slow
         // one is visible as running work rather than silence. The lease releases
         // on Drop — including the panic path caught just below.
-        let _activity = crate::activity::begin(format!("{name} (tools/call)"));
+        let activity_label = format!("{name} (tools/call)");
+        let _activity = match tool.execution_policy(&args) {
+            ExecutionPolicy::Lane(lane) => crate::activity::begin_in_lane(activity_label, lane),
+            ExecutionPolicy::Concurrent | ExecutionPolicy::Serialized => {
+                crate::activity::begin(activity_label)
+            }
+        };
 
         // A panic in a handler must not take down the long-running server (or,
         // worse, silently kill the FIFO mutation worker). Contain it here and
@@ -868,6 +875,28 @@ impl McpServer {
             .cloned()
             .unwrap_or(Value::Null);
         self.config.registry.mutates(name, &args)
+    }
+
+    fn line_execution_policy(&self, line: &str) -> ExecutionPolicy {
+        let Ok(message) = serde_json::from_str::<Value>(line) else {
+            return ExecutionPolicy::Concurrent;
+        };
+        if message.get("method").and_then(Value::as_str) != Some("tools/call") {
+            return ExecutionPolicy::Concurrent;
+        }
+        let Some(name) = message
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(Value::as_str)
+        else {
+            return ExecutionPolicy::Concurrent;
+        };
+        let args = message
+            .get("params")
+            .and_then(|p| p.get("arguments"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        self.config.registry.execution_policy(name, &args)
     }
 }
 
@@ -996,15 +1025,16 @@ pub enum ServerEvent {
 }
 
 /// Routes each request to the path that keeps the control surface correct:
-/// mutating tool calls go to a single ordered worker so they execute in strict
-/// arrival order and pipelined dependent mutations can never reorder; read-only
-/// calls are spawned concurrently so a slow mutation never wedges reads.
+/// calls use their independent [`ExecutionPolicy`]: the compatibility default
+/// sends mutations to one ordered worker and spawns reads concurrently, while
+/// named lanes serialize only the tools that share that lane.
 /// `#[doc(hidden)]`-public for app regression suites.
 #[doc(hidden)]
 pub struct Dispatch {
     server: McpServer,
     events_tx: mpsc::Sender<ServerEvent>,
     mutations_tx: mpsc::Sender<String>,
+    lanes: Mutex<HashMap<String, mpsc::Sender<String>>>,
     owner: Option<OwnerEndpoint>,
 }
 
@@ -1028,22 +1058,53 @@ impl Dispatch {
             server,
             events_tx,
             mutations_tx,
+            lanes: Mutex::new(HashMap::new()),
             owner,
         }
     }
 
     pub fn dispatch(&self, line: String) {
-        if self.server.line_calls_mutating_tool(&line) {
-            let _ = self.mutations_tx.send(line);
-        } else {
-            let server = self.server.clone();
-            let tx = self.events_tx.clone();
-            let owner = self.owner.clone();
-            thread::spawn(move || {
-                let response = handle_line_contained(&server, &line, owner.as_ref());
-                let _ = tx.send(ServerEvent::Completed(response));
-            });
+        match self.server.line_execution_policy(&line) {
+            ExecutionPolicy::Serialized => {
+                let _ = self.mutations_tx.send(line);
+            }
+            ExecutionPolicy::Lane(lane) => {
+                let sender = self.lane_sender(lane);
+                let _ = sender.send(line);
+            }
+            ExecutionPolicy::Concurrent => {
+                let server = self.server.clone();
+                let tx = self.events_tx.clone();
+                let owner = self.owner.clone();
+                thread::spawn(move || {
+                    let response = handle_line_contained(&server, &line, owner.as_ref());
+                    let _ = tx.send(ServerEvent::Completed(response));
+                });
+            }
         }
+    }
+
+    fn lane_sender(&self, lane: String) -> mpsc::Sender<String> {
+        let mut lanes = self
+            .lanes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(sender) = lanes.get(&lane) {
+            return sender.clone();
+        }
+
+        let (tx, rx) = mpsc::channel::<String>();
+        let server = self.server.clone();
+        let events = self.events_tx.clone();
+        let owner = self.owner.clone();
+        thread::spawn(move || {
+            for line in rx {
+                let response = handle_line_contained(&server, &line, owner.as_ref());
+                let _ = events.send(ServerEvent::Completed(response));
+            }
+        });
+        lanes.insert(lane, tx.clone());
+        tx
     }
 }
 
@@ -1222,7 +1283,7 @@ fn spawn_parent_watchdog(_env_prefix: &str, _tx: mpsc::Sender<ServerEvent>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ToolSpec, INTERNAL_ERROR};
+    use crate::types::{ExecutionPolicy, ToolSpec, INTERNAL_ERROR};
     use serde_json::json;
 
     /// Run `f` with the default panic hook silenced, so tests that provoke an
@@ -1705,6 +1766,134 @@ mod tests {
         assert!(server.line_calls_mutating_tool(
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"todo_create","arguments":{}}}"#
         ));
+    }
+
+    #[test]
+    fn default_execution_policy_preserves_dynamic_read_write_dispatch() {
+        let server = McpServer::new(ServerConfig::new("todo", "0.1.0", ".").tool(
+            ToolSpec::dynamic(
+                "todo_upsert",
+                "Read or write",
+                json!({ "type": "object" }),
+                |args| args.get("write").and_then(Value::as_bool).unwrap_or(false),
+                |_ctx, _args| Ok(json!({ "ok": true })),
+            ),
+        ));
+        let frame = |id, write| {
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "todo_upsert", "arguments": { "write": write } }
+            })
+            .to_string()
+        };
+        assert_eq!(
+            server.line_execution_policy(&frame(1, false)),
+            ExecutionPolicy::Concurrent
+        );
+        assert_eq!(
+            server.line_execution_policy(&frame(2, true)),
+            ExecutionPolicy::Serialized
+        );
+    }
+
+    #[test]
+    fn read_only_tools_share_one_lane_without_blocking_another_lane() {
+        use std::sync::mpsc;
+        use std::sync::{Arc, Mutex};
+
+        let (entered_tx, entered_rx) = mpsc::channel::<&'static str>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let a_entered = entered_tx.clone();
+        let a_release = release_rx.clone();
+        let b_entered = entered_tx.clone();
+        let c_entered = entered_tx;
+        let server = McpServer::new(
+            ServerConfig::new("todo", "0.1.0", ".")
+                .tool(
+                    ToolSpec::read(
+                        "lane_a",
+                        "First bridge read",
+                        json!({ "type": "object" }),
+                        move |_ctx, _args| {
+                            a_entered.send("a").unwrap();
+                            a_release
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(5))
+                                .unwrap();
+                            Ok(json!({ "tool": "a" }))
+                        },
+                    )
+                    .with_execution_policy(ExecutionPolicy::Lane("bridge".into())),
+                )
+                .tool(
+                    ToolSpec::read(
+                        "lane_b",
+                        "Second bridge read",
+                        json!({ "type": "object" }),
+                        move |_ctx, _args| {
+                            b_entered.send("b").unwrap();
+                            Ok(json!({ "tool": "b" }))
+                        },
+                    )
+                    .with_execution_policy(ExecutionPolicy::Lane("bridge".into())),
+                )
+                .tool(
+                    ToolSpec::read(
+                        "lane_c",
+                        "Independent read",
+                        json!({ "type": "object" }),
+                        move |_ctx, _args| {
+                            c_entered.send("c").unwrap();
+                            Ok(json!({ "tool": "c" }))
+                        },
+                    )
+                    .with_execution_policy(ExecutionPolicy::Lane("other".into())),
+                ),
+        );
+
+        let listed: Value = serde_json::from_str(
+            &server
+                .handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["annotations"]["readOnlyHint"] == true));
+
+        let (events_tx, events_rx) = mpsc::channel();
+        let dispatch = Dispatch::new(server, events_tx, None);
+        dispatch.dispatch(call_frame(2, "lane_a"));
+        assert_eq!(
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "a"
+        );
+        dispatch.dispatch(call_frame(3, "lane_b"));
+        dispatch.dispatch(call_frame(4, "lane_c"));
+        assert_eq!(
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "c",
+            "a different lane must run while the bridge lane is occupied"
+        );
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "the second bridge call must not enter while the first holds its lane"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "b"
+        );
+        for _ in 0..3 {
+            assert!(matches!(
+                events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                ServerEvent::Completed(Some(_))
+            ));
+        }
     }
 
     #[cfg(unix)]

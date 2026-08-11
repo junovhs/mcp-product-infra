@@ -36,4 +36,4 @@ pub use sidecar::{
     OwnerRecovery, OwnerTransportError, RetiredOwner, SidecarConfig,
 };
 pub use types::kinds;
-pub use types::{MutationKind, ToolContext, ToolError, ToolResult, ToolSpec};
+pub use types::{ExecutionPolicy, MutationKind, ToolContext, ToolError, ToolResult, ToolSpec};

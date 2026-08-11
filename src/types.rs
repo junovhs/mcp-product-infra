@@ -168,6 +168,22 @@ impl MutationKind {
     }
 }
 
+/// How the dispatcher schedules a tool call (DEC-02).
+///
+/// This is deliberately independent of [`MutationKind`]: a logically read-only
+/// tool may still need exclusive access to a process-wide, non-reentrant
+/// resource. Calls in the same named lane execute FIFO, while different lanes
+/// remain concurrent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutionPolicy {
+    /// Run independently of other calls.
+    Concurrent,
+    /// Use the server's existing global serialized worker.
+    Serialized,
+    /// Execute FIFO with every other tool assigned to this named lane.
+    Lane(String),
+}
+
 /// A single MCP tool exposed by the app.
 #[derive(Clone)]
 pub struct ToolSpec {
@@ -175,6 +191,10 @@ pub struct ToolSpec {
     pub description: String,
     pub input_schema: Value,
     pub mutation: MutationKind,
+    /// Explicit scheduling policy. `None` preserves the historical behavior:
+    /// calls classified as mutations are serialized and other calls run
+    /// concurrently.
+    pub execution: Option<ExecutionPolicy>,
     pub handler: Handler,
     /// Extra `tools/list` annotation members merged over the derived set
     /// (override keys win). `readOnlyHint` is always derived from `mutation`
@@ -185,6 +205,23 @@ pub struct ToolSpec {
 }
 
 impl ToolSpec {
+    /// Override the scheduling policy without changing mutation annotations.
+    pub fn with_execution_policy(mut self, policy: ExecutionPolicy) -> Self {
+        self.execution = Some(policy);
+        self
+    }
+
+    /// The policy for these arguments, including the compatibility default.
+    pub fn execution_policy(&self, args: &Value) -> ExecutionPolicy {
+        self.execution.clone().unwrap_or_else(|| {
+            if self.mutation.mutates(args) {
+                ExecutionPolicy::Serialized
+            } else {
+                ExecutionPolicy::Concurrent
+            }
+        })
+    }
+
     /// Merge extra `tools/list` annotation members over the derived set
     /// (override keys win). See the `annotations` field.
     pub fn with_annotations(mut self, annotations: Value) -> Self {
@@ -203,6 +240,7 @@ impl ToolSpec {
             description: description.into(),
             input_schema,
             mutation: MutationKind::Never,
+            execution: None,
             handler: Arc::new(handler),
             annotations: None,
         }
@@ -219,6 +257,7 @@ impl ToolSpec {
             description: description.into(),
             input_schema,
             mutation: MutationKind::Always,
+            execution: None,
             handler: Arc::new(handler),
             annotations: None,
         }
@@ -236,6 +275,7 @@ impl ToolSpec {
             description: description.into(),
             input_schema,
             mutation: MutationKind::Dynamic(Arc::new(mutates)),
+            execution: None,
             handler: Arc::new(handler),
             annotations: None,
         }
