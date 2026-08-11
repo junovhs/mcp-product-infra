@@ -6,6 +6,18 @@
 
 use crate::types::{ExecutionPolicy, Handler, ToolSpec};
 use serde_json::{json, Value};
+use std::collections::HashSet;
+
+/// A structural defect that can make registry metadata inert or misleading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegistryDefect {
+    DuplicateToolName { tool: String },
+    EmptyToolName { index: usize },
+    EmptyDescription { tool: String },
+    InputSchemaNotObject { tool: String },
+    AnnotationsNotObject { tool: String },
+    ReadOnlyMutationConflict { tool: String },
+}
 
 /// An ordered registry of tools. `tools/list` is rendered from this registry and
 /// `tools/call` dispatches through it.
@@ -52,6 +64,60 @@ impl ToolRegistry {
         self.get(name)
             .map(|tool| tool.execution_policy(args))
             .unwrap_or(ExecutionPolicy::Concurrent)
+    }
+
+    /// Report every structural defect instead of stopping at the first one.
+    /// Validation is observational: registration remains infallible and keeps
+    /// its existing builder API.
+    pub fn validate(&self) -> Result<(), Vec<RegistryDefect>> {
+        let mut defects = Vec::new();
+        let mut names = HashSet::new();
+
+        for (index, tool) in self.tools.iter().enumerate() {
+            if tool.name.trim().is_empty() {
+                defects.push(RegistryDefect::EmptyToolName { index });
+            } else if !names.insert(tool.name.as_str()) {
+                defects.push(RegistryDefect::DuplicateToolName {
+                    tool: tool.name.clone(),
+                });
+            }
+            if tool.description.trim().is_empty() {
+                defects.push(RegistryDefect::EmptyDescription {
+                    tool: tool.name.clone(),
+                });
+            }
+            if !tool.input_schema.is_object() {
+                defects.push(RegistryDefect::InputSchemaNotObject {
+                    tool: tool.name.clone(),
+                });
+            }
+
+            match &tool.annotations {
+                Some(Value::Object(annotations)) => {
+                    let claims_read_only = annotations
+                        .get("readOnlyHint")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if claims_read_only
+                        && !matches!(tool.mutation, crate::types::MutationKind::Never)
+                    {
+                        defects.push(RegistryDefect::ReadOnlyMutationConflict {
+                            tool: tool.name.clone(),
+                        });
+                    }
+                }
+                Some(_) => defects.push(RegistryDefect::AnnotationsNotObject {
+                    tool: tool.name.clone(),
+                }),
+                None => {}
+            }
+        }
+
+        if defects.is_empty() {
+            Ok(())
+        } else {
+            Err(defects)
+        }
     }
 
     pub fn tools_list_result(&self) -> Value {
@@ -129,4 +195,69 @@ pub fn op_is_read(args: &Value, read_ops: &[&str]) -> bool {
     args.get("op")
         .and_then(Value::as_str)
         .is_some_and(|op| read_ops.contains(&op))
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use crate::types::ToolSpec;
+
+    fn read(name: &str) -> ToolSpec {
+        ToolSpec::read(
+            name,
+            "Read a value",
+            json!({ "type": "object", "properties": {} }),
+            |_ctx, _args| Ok(json!({ "ok": true })),
+        )
+    }
+
+    #[test]
+    fn validation_reports_each_silent_registry_defect() {
+        let registry = ToolRegistry::new()
+            .with(read("duplicate"))
+            .with(read("duplicate"))
+            .with(ToolSpec::read(
+                "bad_schema",
+                "Bad schema",
+                json!(["not", "an", "object"]),
+                |_ctx, _args| Ok(json!({})),
+            ))
+            .with(
+                ToolSpec::write(
+                    "misleading_write",
+                    "Write",
+                    json!({ "type": "object" }),
+                    |_ctx, _args| Ok(json!({})),
+                )
+                .with_annotations(json!({ "readOnlyHint": true })),
+            );
+
+        let defects = registry.validate().unwrap_err();
+        assert!(defects.contains(&RegistryDefect::DuplicateToolName {
+            tool: "duplicate".into()
+        }));
+        assert!(defects.contains(&RegistryDefect::InputSchemaNotObject {
+            tool: "bad_schema".into()
+        }));
+        assert!(defects.contains(&RegistryDefect::ReadOnlyMutationConflict {
+            tool: "misleading_write".into()
+        }));
+        assert_eq!(defects.len(), 3);
+    }
+
+    #[test]
+    fn a_normal_registry_validates_cleanly() {
+        assert_eq!(
+            ToolRegistry::new()
+                .with(read("status"))
+                .with(ToolSpec::write(
+                    "create",
+                    "Create a value",
+                    json!({ "type": "object", "properties": {} }),
+                    |_ctx, _args| Ok(json!({ "created": true })),
+                ))
+                .validate(),
+            Ok(())
+        );
+    }
 }

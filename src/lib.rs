@@ -25,9 +25,10 @@ pub use adapters::{
     InstallReport,
 };
 pub use manifest::{
-    HandlerCommand, HandlerRequest, HandlerResponse, Manifest, ManifestMutation, ManifestTool,
+    HandlerCommand, HandlerRequest, HandlerResponse, Manifest, ManifestDefect, ManifestMutation,
+    ManifestTool,
 };
-pub use registry::ToolRegistry;
+pub use registry::{RegistryDefect, ToolRegistry};
 pub use resources::{ResourceContent, ResourceEntry, ResourceProvider};
 pub use response::{error_frame, error_frame_for, error_frame_kinded, result_frame, tool_ok};
 pub use server::{BeforeToolHook, McpServer, MutationHook, OwnerProse, ServerConfig};
