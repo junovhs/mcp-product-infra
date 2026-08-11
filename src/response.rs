@@ -27,6 +27,45 @@ pub fn result_frame(id: Value, result: Value) -> String {
     json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
 }
 
+/// Upgrade a successful legacy-shaped result frame to the 2026-07-28 result
+/// envelope. Error frames pass through unchanged.
+pub fn modernize_result_frame(
+    frame: &str,
+    server_name: &str,
+    server_version: &str,
+    cacheable_list: bool,
+) -> String {
+    let Ok(mut frame) = serde_json::from_str::<Value>(frame) else {
+        return frame.to_string();
+    };
+    let Some(result) = frame.get_mut("result").and_then(Value::as_object_mut) else {
+        return frame.to_string();
+    };
+
+    result
+        .entry("resultType")
+        .or_insert_with(|| Value::String("complete".to_string()));
+    let metadata = result
+        .entry("_meta")
+        .or_insert_with(|| json!({}))
+        .as_object_mut();
+    if let Some(metadata) = metadata {
+        metadata.insert(
+            "io.modelcontextprotocol/serverInfo".to_string(),
+            json!({ "name": server_name, "version": server_version }),
+        );
+    }
+    if cacheable_list {
+        // No freshness policy is implied: zero means immediately stale, and
+        // private prevents sharing app-specific lists between clients.
+        result.entry("ttlMs").or_insert_with(|| json!(0));
+        result
+            .entry("cacheScope")
+            .or_insert_with(|| Value::String("private".to_string()));
+    }
+    frame.to_string()
+}
+
 pub fn error_frame(id: Value, code: i64, message: &str) -> String {
     json!({
         "jsonrpc": "2.0",
@@ -89,5 +128,20 @@ mod tests {
         assert_eq!(payload["content"][0]["text"], "line one\nline two");
         assert_eq!(payload.get("structuredContent"), None);
         assert_eq!(payload["isError"], false);
+    }
+
+    #[test]
+    fn modern_result_metadata_preserves_the_payload() {
+        let frame = result_frame(json!(7), json!({ "tools": [] }));
+        let modern: Value =
+            serde_json::from_str(&modernize_result_frame(&frame, "todo", "1.2.3", true)).unwrap();
+        assert_eq!(modern["result"]["resultType"], "complete");
+        assert_eq!(modern["result"]["tools"], json!([]));
+        assert_eq!(modern["result"]["ttlMs"], 0);
+        assert_eq!(modern["result"]["cacheScope"], "private");
+        assert_eq!(
+            modern["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "todo"
+        );
     }
 }

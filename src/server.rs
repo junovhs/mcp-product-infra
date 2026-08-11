@@ -10,7 +10,9 @@
 //! - shutdown drain and parent-death watchdogs
 
 use crate::registry::ToolRegistry;
-use crate::response::{error_frame, error_frame_kinded, result_frame, tool_ok};
+use crate::response::{
+    error_frame, error_frame_kinded, modernize_result_frame, result_frame, tool_ok,
+};
 use crate::sidecar::{self, OwnerEndpoint, OwnerRecovery, SidecarConfig};
 use crate::types::kinds;
 use crate::types::{
@@ -25,6 +27,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
+pub const STATELESS_PROTOCOL_VERSION: &str = "2026-07-28";
+pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
+    STATELESS_PROTOCOL_VERSION,
+    "2025-11-25",
+    DEFAULT_PROTOCOL_VERSION,
+    "2025-03-26",
+    "2024-11-05",
+];
 const DEFAULT_SHUTDOWN_DRAIN: Duration = Duration::from_secs(120);
 #[cfg(unix)]
 const DEFAULT_PARENT_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -494,13 +505,19 @@ impl McpServer {
             }
         };
 
-        match method {
+        let modern = match self.modern_request(&message, method) {
+            Ok(modern) => modern,
+            Err(response) => return is_request.then_some(response),
+        };
+
+        let response = match method {
             // FIX-02: a frame with no `id` key is a JSON-RPC notification — it
             // must never receive a response, and a notification-shaped
             // tools/call must never execute a tool. (An explicit `id: null`
             // still counts as request-shaped; that handling is unchanged.)
             _ if !is_request => None,
-            "initialize" => Some(result_frame(id, self.initialize_result(&message))),
+            "initialize" if !modern => Some(result_frame(id, self.initialize_result(&message))),
+            "server/discover" => Some(result_frame(id, self.discover_result())),
             "tools/list" => Some(result_frame(id, self.config.registry.tools_list_result())),
             "tools/call" => Some(self.tools_call(id, &message)),
             "resources/list" if self.config.resources.is_some() => {
@@ -531,6 +548,19 @@ impl McpServer {
                     Some(&json!({ "method": method })),
                 )
             }),
+        };
+
+        if modern {
+            response.map(|frame| {
+                modernize_result_frame(
+                    &frame,
+                    &self.config.app_name,
+                    &self.config.version,
+                    matches!(method, "server/discover" | "tools/list" | "resources/list"),
+                )
+            })
+        } else {
+            response
         }
     }
 
@@ -767,6 +797,93 @@ impl McpServer {
                 "name": self.config.app_name.clone(),
                 "version": self.config.version.clone(),
             }
+        });
+        if let Some(instructions) = &self.config.instructions {
+            result["instructions"] = Value::String(instructions.clone());
+        }
+        result
+    }
+
+    fn modern_request(&self, message: &Value, method: &str) -> Result<bool, String> {
+        let metadata = message.get("params").and_then(|params| params.get("_meta"));
+        let has_modern_key = metadata.is_some_and(|metadata| {
+            metadata
+                .get("io.modelcontextprotocol/protocolVersion")
+                .is_some()
+                || metadata.get("io.modelcontextprotocol/clientInfo").is_some()
+                || metadata
+                    .get("io.modelcontextprotocol/clientCapabilities")
+                    .is_some()
+        });
+        let modern = method == "server/discover" || has_modern_key;
+        if !modern {
+            return Ok(false);
+        }
+
+        let id = message.get("id").cloned().unwrap_or(Value::Null);
+        let Some(metadata) = metadata.and_then(Value::as_object) else {
+            return Err(error_frame(
+                id,
+                INVALID_PARAMS,
+                "Missing modern request metadata",
+            ));
+        };
+        let Some(requested) = metadata
+            .get("io.modelcontextprotocol/protocolVersion")
+            .and_then(Value::as_str)
+        else {
+            return Err(error_frame(
+                id,
+                INVALID_PARAMS,
+                "Missing io.modelcontextprotocol/protocolVersion",
+            ));
+        };
+        if requested != STATELESS_PROTOCOL_VERSION {
+            return Err(error_frame_kinded(
+                id,
+                UNSUPPORTED_PROTOCOL_VERSION,
+                "Unsupported protocol version",
+                None,
+                Some(&json!({
+                    "supported": SUPPORTED_PROTOCOL_VERSIONS,
+                    "requested": requested,
+                })),
+            ));
+        }
+        if !metadata
+            .get("io.modelcontextprotocol/clientCapabilities")
+            .is_some_and(Value::is_object)
+        {
+            return Err(error_frame(
+                id,
+                INVALID_PARAMS,
+                "Missing io.modelcontextprotocol/clientCapabilities",
+            ));
+        }
+        if let Some(client_info) = metadata.get("io.modelcontextprotocol/clientInfo") {
+            let valid = client_info.as_object().is_some_and(|client_info| {
+                client_info.get("name").is_some_and(Value::is_string)
+                    && client_info.get("version").is_some_and(Value::is_string)
+            });
+            if !valid {
+                return Err(error_frame(
+                    id,
+                    INVALID_PARAMS,
+                    "Invalid io.modelcontextprotocol/clientInfo",
+                ));
+            }
+        }
+        Ok(true)
+    }
+
+    fn discover_result(&self) -> Value {
+        let mut capabilities = json!({ "tools": {} });
+        if self.config.resources.is_some() {
+            capabilities["resources"] = json!({});
+        }
+        let mut result = json!({
+            "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
+            "capabilities": capabilities,
         });
         if let Some(instructions) = &self.config.instructions {
             result["instructions"] = Value::String(instructions.clone());
@@ -1689,6 +1806,131 @@ mod tests {
             .unwrap();
         let tools: Value = serde_json::from_str(&tools).unwrap();
         assert_eq!(tools["result"]["tools"][0]["name"], "todo_status");
+        assert_eq!(tools["result"].get("resultType"), None);
+        assert_eq!(tools["result"].get("_meta"), None);
+    }
+
+    fn stateless_metadata(version: &str) -> Value {
+        json!({
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "frame-test",
+                "version": "1.0.0",
+            },
+            "io.modelcontextprotocol/clientCapabilities": {},
+        })
+    }
+
+    fn stateless_test_server() -> McpServer {
+        McpServer::new(
+            ServerConfig::new("todo", "0.1.0", ".")
+                .instructions("Use todo_* tools.")
+                .tool(ToolSpec::read(
+                    "todo_status",
+                    "Return status",
+                    json!({ "type": "object", "properties": {} }),
+                    |_ctx, _args| Ok(json!({ "ok": true })),
+                )),
+        )
+    }
+
+    #[test]
+    fn stateless_discovery_reports_versions_capabilities_and_identity() {
+        let server = stateless_test_server();
+        let response = server
+            .handle_line(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "discover-1",
+                    "method": "server/discover",
+                    "params": { "_meta": stateless_metadata(STATELESS_PROTOCOL_VERSION) },
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["resultType"], "complete");
+        assert_eq!(response["result"]["supportedVersions"][0], "2026-07-28");
+        assert!(response["result"]["capabilities"]["tools"].is_object());
+        assert_eq!(response["result"]["ttlMs"], 0);
+        assert_eq!(response["result"]["cacheScope"], "private");
+        assert_eq!(
+            response["result"]["_meta"]["io.modelcontextprotocol/serverInfo"],
+            json!({ "name": "todo", "version": "0.1.0" })
+        );
+        assert_eq!(response["result"]["instructions"], "Use todo_* tools.");
+    }
+
+    #[test]
+    fn stateless_list_and_call_need_no_initialize_and_carry_modern_results() {
+        let server = stateless_test_server();
+        let list = server
+            .handle_line(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": { "_meta": stateless_metadata(STATELESS_PROTOCOL_VERSION) },
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let list: Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(list["result"]["resultType"], "complete");
+        assert_eq!(list["result"]["tools"][0]["name"], "todo_status");
+        assert_eq!(list["result"]["ttlMs"], 0);
+        assert_eq!(list["result"]["cacheScope"], "private");
+        assert_eq!(
+            list["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "todo"
+        );
+
+        let call = server
+            .handle_line(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "_meta": stateless_metadata(STATELESS_PROTOCOL_VERSION),
+                        "name": "todo_status",
+                        "arguments": {},
+                    },
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let call: Value = serde_json::from_str(&call).unwrap();
+        assert_eq!(call["result"]["resultType"], "complete");
+        assert_eq!(call["result"]["structuredContent"]["ok"], true);
+        assert_eq!(
+            call["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["version"],
+            "0.1.0"
+        );
+    }
+
+    #[test]
+    fn stateless_request_rejects_an_unsupported_version_with_choices() {
+        let server = stateless_test_server();
+        let response = server
+            .handle_line(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/list",
+                    "params": { "_meta": stateless_metadata("1900-01-01") },
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], UNSUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(response["error"]["data"]["requested"], "1900-01-01");
+        assert!(response["error"]["data"]["supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|version| version == STATELESS_PROTOCOL_VERSION));
     }
 
     #[test]
