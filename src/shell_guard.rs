@@ -19,8 +19,16 @@
 //! - **Explicit enable only** (the DEC-88 discipline): nothing here runs on
 //!   startup or tool calls — apps expose it behind an explicit opt-in flag.
 
+use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Result of trying to materialize a guarded-tool shim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShimInstall {
+    Installed { shim: PathBuf, real_tool: PathBuf },
+    SkippedMissingTool { tool: String },
+}
 
 /// The marker pair delimiting the app-owned block in a shell rc file.
 pub fn rc_markers(app_name: &str) -> (String, String) {
@@ -34,8 +42,9 @@ pub fn rc_markers(app_name: &str) -> (String, String) {
 pub fn rc_block(app_name: &str, shim_dir: &Path) -> String {
     let (begin, end) = rc_markers(app_name);
     format!(
-        "{begin}\n# Managed by `{app_name} enable --shell-guard` — remove with `--shell-guard --remove`.\nexport PATH=\"{}:$PATH\"\n{end}\n",
-        shim_dir.display()
+        "{begin}\n# Managed by `{app_name} enable --shell-guard` — remove with `--shell-guard --remove`.\ncase \":$PATH:\" in\n  *:\"{}\":*) ;;\n  *) export PATH=\"{}:$PATH\" ;;\nesac\n{end}\n",
+        shim_dir.display(),
+        shim_dir.display(),
     )
 }
 
@@ -69,7 +78,7 @@ for dir in $PATH; do
     exec "$dir/rg" "$@"
   fi
 done
-echo "{app_name} shell-guard: real ripgrep not found on PATH" >&2
+echo "{app_name} shell-guard: ripgrep is not installed or is no longer on PATH behind the shim; install it, then re-enable the shell guard" >&2
 exit 127
 "#
     )
@@ -101,24 +110,59 @@ for /f "delims=" %%R in ('where rg.exe 2^>nul') do (
   "%%~fR" %*
   exit /b
 )
-echo {app_name} shell-guard: real ripgrep not found on PATH 1>&2
+echo {app_name} shell-guard: ripgrep is not installed or is no longer on PATH behind the shim; install it, then re-enable the shell guard 1>&2
 exit /b 127
 "#
     )
 }
 
-/// Idempotently write the executable `rg` shim into `shim_dir`.
+/// Idempotently write the executable `rg` shim when a real ripgrep is already
+/// available on PATH. If it is absent, remove any stale shim and report the
+/// skip so callers never turn "command not found" into a permanent exit 127.
 pub fn ensure_rg_shim(shim_dir: &Path, app_name: &str, guard_bin: &str) -> Result<(), String> {
+    ensure_rg_shim_report(shim_dir, app_name, guard_bin).map(|_| ())
+}
+
+/// [`ensure_rg_shim`] with an explicit installed/skipped result for readiness
+/// surfaces that need to explain a missing guarded tool.
+pub fn ensure_rg_shim_report(
+    shim_dir: &Path,
+    app_name: &str,
+    guard_bin: &str,
+) -> Result<ShimInstall, String> {
+    let search_path = std::env::var_os("PATH").unwrap_or_default();
+    ensure_rg_shim_on_path(shim_dir, app_name, guard_bin, &search_path)
+}
+
+fn ensure_rg_shim_on_path(
+    shim_dir: &Path,
+    app_name: &str,
+    guard_bin: &str,
+    search_path: &OsStr,
+) -> Result<ShimInstall, String> {
+    let Some(real_tool) = find_real_tool(search_path, shim_dir, "rg") else {
+        remove_rg_shim(shim_dir)?;
+        return Ok(ShimInstall::SkippedMissingTool {
+            tool: "rg".to_string(),
+        });
+    };
     let script = rg_shim_script(app_name, guard_bin);
     let path = shim_dir.join("rg");
     if fs::read_to_string(&path).ok().as_deref() == Some(script.as_str()) {
         ensure_executable(&path)?;
-        return Ok(());
+        return Ok(ShimInstall::Installed {
+            shim: path,
+            real_tool,
+        });
     }
     fs::create_dir_all(shim_dir)
         .map_err(|e| format!("failed to create {}: {e}", shim_dir.display()))?;
     fs::write(&path, script).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
-    ensure_executable(&path)
+    ensure_executable(&path)?;
+    Ok(ShimInstall::Installed {
+        shim: path,
+        real_tool,
+    })
 }
 
 /// Idempotently write the Windows `rg.cmd` shim into `shim_dir`.
@@ -127,14 +171,66 @@ pub fn ensure_windows_rg_shim(
     app_name: &str,
     guard_bin: &str,
 ) -> Result<(), String> {
+    ensure_windows_rg_shim_report(shim_dir, app_name, guard_bin).map(|_| ())
+}
+
+/// [`ensure_windows_rg_shim`] with an explicit installed/skipped result for
+/// readiness surfaces.
+pub fn ensure_windows_rg_shim_report(
+    shim_dir: &Path,
+    app_name: &str,
+    guard_bin: &str,
+) -> Result<ShimInstall, String> {
+    let search_path = std::env::var_os("PATH").unwrap_or_default();
+    ensure_windows_rg_shim_on_path(shim_dir, app_name, guard_bin, &search_path)
+}
+
+fn ensure_windows_rg_shim_on_path(
+    shim_dir: &Path,
+    app_name: &str,
+    guard_bin: &str,
+    search_path: &OsStr,
+) -> Result<ShimInstall, String> {
+    let Some(real_tool) = find_real_tool(search_path, shim_dir, "rg.exe") else {
+        remove_windows_rg_shim(shim_dir)?;
+        return Ok(ShimInstall::SkippedMissingTool {
+            tool: "rg.exe".to_string(),
+        });
+    };
     let script = windows_rg_shim_script(app_name, guard_bin);
     let path = shim_dir.join("rg.cmd");
     if fs::read_to_string(&path).ok().as_deref() == Some(script.as_str()) {
-        return Ok(());
+        return Ok(ShimInstall::Installed {
+            shim: path,
+            real_tool,
+        });
     }
     fs::create_dir_all(shim_dir)
         .map_err(|e| format!("failed to create {}: {e}", shim_dir.display()))?;
-    fs::write(&path, script).map_err(|e| format!("failed to write {}: {e}", path.display()))
+    fs::write(&path, script).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    Ok(ShimInstall::Installed {
+        shim: path,
+        real_tool,
+    })
+}
+
+fn find_real_tool(search_path: &OsStr, shim_dir: &Path, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(search_path)
+        .filter(|dir| dir != shim_dir)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// Remove the shim (and its directory when that leaves it empty). Missing
@@ -279,17 +375,36 @@ fn find_block(text: &str, app_name: &str) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
 
+    fn write_executable(path: &Path, contents: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
     #[test]
     fn shim_is_written_executable_and_idempotently() {
         let dir = tempfile::tempdir().unwrap();
         let shim_dir = dir.path().join("shims");
-        ensure_rg_shim(&shim_dir, "todo", "/opt/todo/bin/todo").unwrap();
+        let real_dir = dir.path().join("real-bin");
+        write_executable(
+            &real_dir.join("rg"),
+            "#!/bin/sh\nprintf 'real-rg %s' \"$1\"\n",
+        );
+        let search_path = std::env::join_paths([&real_dir]).unwrap();
+        let installed =
+            ensure_rg_shim_on_path(&shim_dir, "todo", "/opt/todo/bin/todo", &search_path).unwrap();
+        assert!(matches!(installed, ShimInstall::Installed { .. }));
         let path = shim_dir.join("rg");
         let script = fs::read_to_string(&path).unwrap();
         assert!(script.starts_with("#!/bin/sh"));
         assert!(script.contains("GUARD=\"/opt/todo/bin/todo\""));
         assert!(script.contains("agent-guard --check-rg -- \"$@\""));
         assert!(script.contains("exec \"$dir/rg\""), "fail-open passthrough");
+        assert!(script.contains("ripgrep is not installed or is no longer on PATH"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -299,12 +414,27 @@ mod tests {
             );
         }
         let before = fs::read(&path).unwrap();
-        ensure_rg_shim(&shim_dir, "todo", "/opt/todo/bin/todo").unwrap();
+        ensure_rg_shim_on_path(&shim_dir, "todo", "/opt/todo/bin/todo", &search_path).unwrap();
         assert_eq!(
             fs::read(&path).unwrap(),
             before,
             "second run is byte-identical"
         );
+
+        #[cfg(unix)]
+        {
+            let mut invocation_path = vec![shim_dir.clone(), real_dir.clone()];
+            invocation_path.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            let output = std::process::Command::new(&path)
+                .arg("sentinel")
+                .env("PATH", std::env::join_paths(invocation_path).unwrap())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"real-rg sentinel");
+        }
 
         remove_rg_shim(&shim_dir).unwrap();
         assert!(!path.exists());
@@ -312,10 +442,63 @@ mod tests {
     }
 
     #[test]
+    fn missing_ripgrep_skips_install_and_removes_a_stale_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = dir.path().join("shims");
+        fs::create_dir_all(&shim_dir).unwrap();
+        fs::write(shim_dir.join("rg"), "stale shim").unwrap();
+
+        let empty_path = std::env::join_paths([dir.path().join("empty-bin")]).unwrap();
+        let result =
+            ensure_rg_shim_on_path(&shim_dir, "todo", "/opt/todo/bin/todo", &empty_path).unwrap();
+        assert_eq!(
+            result,
+            ShimInstall::SkippedMissingTool {
+                tool: "rg".to_string()
+            }
+        );
+        assert!(!shim_dir.join("rg").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sourcing_the_rc_block_repeatedly_keeps_one_shim_path_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = dir.path().join("shim dir");
+        let rc = dir.path().join("guard.rc");
+        fs::write(&rc, rc_block("todo", &shim_dir)).unwrap();
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(". \"$1\"; . \"$1\"; printf '%s' \"$PATH\"")
+            .arg("guard-test")
+            .arg(&rc)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let path = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            path.split(':')
+                .filter(|segment| *segment == shim_dir.to_string_lossy())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn windows_shim_is_idempotent_and_only_blocks_the_dedicated_exit_code() {
         let dir = tempfile::tempdir().unwrap();
         let shim_dir = dir.path().join("shims");
-        ensure_windows_rg_shim(&shim_dir, "todo", r"C:\Program Files\todo\todo.exe").unwrap();
+        let real_dir = dir.path().join("real-bin");
+        write_executable(&real_dir.join("rg.exe"), "fake windows executable");
+        let search_path = std::env::join_paths([&real_dir]).unwrap();
+        ensure_windows_rg_shim_on_path(
+            &shim_dir,
+            "todo",
+            r"C:\Program Files\todo\todo.exe",
+            &search_path,
+        )
+        .unwrap();
         let path = shim_dir.join("rg.cmd");
         let script = fs::read_to_string(&path).unwrap();
         assert!(script.starts_with("@echo off"));
@@ -326,7 +509,13 @@ mod tests {
         assert!(script.contains("if errorlevel 86 exit /b 2"));
 
         let before = fs::read(&path).unwrap();
-        ensure_windows_rg_shim(&shim_dir, "todo", r"C:\Program Files\todo\todo.exe").unwrap();
+        ensure_windows_rg_shim_on_path(
+            &shim_dir,
+            "todo",
+            r"C:\Program Files\todo\todo.exe",
+            &search_path,
+        )
+        .unwrap();
         assert_eq!(
             fs::read(&path).unwrap(),
             before,
