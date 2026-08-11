@@ -29,6 +29,22 @@ Hard-won behaviors carried over from production incidents, at parity with curren
 - zombie-aware liveness on Unix: an exited-but-unreaped owner reads as dead, so recovery re-elects instead of wedging writes forever (and spawned owners are reaped, so the zombie never forms)
 - exit-code-aware liveness on Windows: an `OpenProcess` handle to a terminated pid is not proof of life
 - fail-closed writes: a live-but-unreachable owner refuses mutations rather than ever spawning a rival writer
+- cancellation-safe mutations: client timeouts, `notifications/cancelled`, and
+  stdin disconnects never abort an in-flight mutation; it runs to completion
+  while the server keeps its serialization lane held
+
+### Cancellation and disconnect contract
+
+A client losing interest does not make an in-flight write safe to interrupt.
+`notifications/cancelled` is accepted as a response-free JSON-RPC notification,
+but it is not forwarded to handlers and does not stop work. If stdin closes,
+the server drains running requests before exiting (up to its configured shutdown
+deadline). A mutation may therefore commit after the client times out or
+disconnects; clients that lose the response must verify state before retrying.
+
+Cooperative cancellation is intentionally not implicit. An application that
+adds it must define its own handler-visible signal and safe interruption points;
+the infrastructure never cuts a mutation at an arbitrary instruction.
 
 ## What it gives you
 

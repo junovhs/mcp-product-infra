@@ -541,6 +541,11 @@ impl McpServer {
                 id,
                 json!({ "activities": crate::activity::snapshot() }),
             )),
+            // DEC-05: notifications/cancelled records only that the client has
+            // lost interest. Dispatch owns no handler cancel token, so a
+            // running mutation continues to its safe completion point. Like
+            // every JSON-RPC notification, cancelled and unknown notification
+            // methods produce no response frame.
             _ if method.starts_with("notifications/") => None,
             _ => is_request.then(|| {
                 error_frame_kinded(
@@ -1559,6 +1564,112 @@ mod tests {
         );
     }
 
+    fn cancellation_test_server(
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        committed: Arc<std::sync::atomic::AtomicBool>,
+    ) -> McpServer {
+        let release = Arc::new(Mutex::new(release));
+        McpServer::new(
+            ServerConfig::new("todo", "0.1.0", ".").tool(ToolSpec::write(
+                "todo_commit",
+                "Commit after the test releases the handler",
+                json!({ "type": "object", "properties": {} }),
+                move |_ctx, _args| {
+                    started.send(()).unwrap();
+                    release.lock().unwrap().recv().unwrap();
+                    committed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(json!({ "committed": true }))
+                },
+            )),
+        )
+    }
+
+    #[test]
+    fn cancelled_notification_does_not_abort_a_running_mutation_or_poison_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let committed = Arc::new(AtomicBool::new(false));
+        let server = cancellation_test_server(started_tx, release_rx, committed.clone());
+        let (events_tx, events_rx) = mpsc::channel();
+        let feeder = events_tx.clone();
+        let feed = thread::spawn(move || {
+            feeder
+                .send(ServerEvent::Line(call_frame(41, "todo_commit")))
+                .unwrap();
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            feeder
+                .send(ServerEvent::Line(
+                    r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":41,"reason":"client timeout"}}"#.to_string(),
+                ))
+                .unwrap();
+            release_tx.send(()).unwrap();
+            feeder
+                .send(ServerEvent::Line(
+                    r#"{"jsonrpc":"2.0","id":42,"method":"ping"}"#.to_string(),
+                ))
+                .unwrap();
+            feeder.send(ServerEvent::InputClosed).unwrap();
+        });
+
+        let mut out = Vec::new();
+        assert_eq!(
+            server.run_event_loop(events_tx, events_rx, None, &mut out),
+            0
+        );
+        feed.join().unwrap();
+        assert!(committed.load(Ordering::SeqCst));
+        let mut ids: Vec<i64> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["id"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![41, 42],
+            "cancel emits no frame; ping still answers"
+        );
+    }
+
+    #[test]
+    fn input_close_drains_a_running_mutation_to_commit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let committed = Arc::new(AtomicBool::new(false));
+        let server = cancellation_test_server(started_tx, release_rx, committed.clone());
+        let (events_tx, events_rx) = mpsc::channel();
+        let feeder = events_tx.clone();
+        let feed = thread::spawn(move || {
+            feeder
+                .send(ServerEvent::Line(call_frame(43, "todo_commit")))
+                .unwrap();
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            feeder.send(ServerEvent::InputClosed).unwrap();
+            release_tx.send(()).unwrap();
+        });
+
+        let mut out = Vec::new();
+        assert_eq!(
+            server.run_event_loop(events_tx, events_rx, None, &mut out),
+            0
+        );
+        feed.join().unwrap();
+        assert!(committed.load(Ordering::SeqCst));
+        let response: Value =
+            serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(response["id"], 43);
+        assert_eq!(response["result"]["structuredContent"]["committed"], true);
+    }
+
     #[test]
     fn before_tool_hook_short_circuits_with_its_error() {
         let server = McpServer::new(
@@ -1658,6 +1769,8 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"initialize","params":{}}"#,
             r#"{"jsonrpc":"2.0","method":"resources/list"}"#,
             r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"todo_create","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":99}}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/vendor_unknown"}"#,
         ] {
             assert_eq!(
                 server.handle_line(line),
