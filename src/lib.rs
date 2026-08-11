@@ -11,6 +11,7 @@ pub mod adapters;
 pub mod agent_guard;
 pub mod capture;
 pub mod manifest;
+pub mod process;
 pub mod registry;
 pub mod resources;
 pub mod response;
@@ -28,6 +29,7 @@ pub use manifest::{
     HandlerCommand, HandlerRequest, HandlerResponse, Manifest, ManifestDefect, ManifestMutation,
     ManifestTool,
 };
+pub use process::{run_with_timeout, ProcessOutcome, ProcessOutput};
 pub use registry::{RegistryDefect, ToolRegistry};
 pub use resources::{ResourceContent, ResourceEntry, ResourceProvider};
 pub use response::{error_frame, error_frame_for, error_frame_kinded, result_frame, tool_ok};
