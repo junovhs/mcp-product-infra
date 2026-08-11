@@ -27,7 +27,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
+/// The first stateless MCP revision supported by this dual-era stdio server.
 pub const STATELESS_PROTOCOL_VERSION: &str = "2026-07-28";
+/// JSON-RPC server-error code required when modern request metadata names a
+/// protocol revision this server does not implement.
 pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
     STATELESS_PROTOCOL_VERSION,
