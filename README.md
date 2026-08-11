@@ -86,6 +86,11 @@ The first tool handler is usually easy. The annoying parts are:
 
 `mcp-product-infra` packages those boring hard parts.
 
+When a production API behaves differently from its nominal contract, use the
+[behavioral truth-table pattern](./docs/behavioral-truth-tables.md) to preserve
+the observation, mitigation, and regression proof instead of rediscovering the
+same failure later.
+
 ## Provenance
 
 This repo is extracted from the MCP work in **Ishoo**, an app whose agent surface is MCP-first.
