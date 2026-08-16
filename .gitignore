@@ -10,3 +10,6 @@ Cargo.lock
 # semmap artifacts (regenerable, not committed - DEC-10)
 SEMMAP.md
 .semmap/
+
+# semclear check output (regenerable dossier artifact)
+semclear-dossier.json

@@ -254,14 +254,17 @@ pub fn try_acquire_exclusive(
 /// One atomic attempt: take the lane if no live lease occupies it, otherwise
 /// report the holder. An exclusive acquire is blocked by any lease in the lane,
 /// exclusive or not — the point of a lane is that its work does not overlap.
-fn claim_locked(label: &str, lane: &str) -> Result<ActivityLease, ActivityView> {
+// The holder is returned boxed: `ActivityView` is a wide struct and this is the
+// hot retry path, so an unboxed `Err` would make every poll iteration move it by
+// value on the stack for a case the caller usually discards.
+fn claim_locked(label: &str, lane: &str) -> Result<ActivityLease, Box<ActivityView>> {
     let mut state = lock_state();
     if let Some((id, record)) = state
         .records
         .iter()
         .find(|(_, record)| record.lane.as_deref() == Some(lane) && !record.is_stale())
     {
-        return Err(record.view(*id));
+        return Err(Box::new(record.view(*id)));
     }
     let record = new_record(label.to_string(), Some(lane.to_string()), true);
     Ok(insert_locked(&mut state, record))

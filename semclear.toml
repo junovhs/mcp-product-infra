@@ -1,0 +1,24 @@
+[engine]
+pass_count = 10
+dossier_candidate_limit = 25
+review_file_limit = 8
+semantic_confirmation_timeout_ms = 90000
+
+[reporting]
+default_output = "console"
+include_scaffold_notice = false
+
+[dead]
+honor_semclear_ignore = true
+
+[locality]
+layers = []
+
+[commands]
+check = [
+    "cargo clippy --all-targets --no-deps -- -D warnings",
+    "cargo test",
+]
+fix = ["cargo fmt"]
+
+[policy]

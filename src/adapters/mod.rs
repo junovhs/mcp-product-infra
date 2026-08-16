@@ -261,15 +261,16 @@ impl HostInstall {
         codex_config: &Path,
         claude_json: &Path,
     ) -> Result<InstallReport, String> {
-        let mut files = Vec::new();
-        files.push((
-            codex_config.display().to_string(),
-            with_action(codex_config, || self.ensure_codex_user_config(codex_config))?,
-        ));
-        files.push((
-            claude_json.display().to_string(),
-            with_action(claude_json, || self.ensure_claude_user_config(claude_json))?,
-        ));
+        let files = vec![
+            (
+                codex_config.display().to_string(),
+                with_action(codex_config, || self.ensure_codex_user_config(codex_config))?,
+            ),
+            (
+                claude_json.display().to_string(),
+                with_action(claude_json, || self.ensure_claude_user_config(claude_json))?,
+            ),
+        ];
         Ok(InstallReport {
             root: codex_config
                 .parent()
@@ -294,15 +295,16 @@ impl HostInstall {
         codex_config: &Path,
         claude_json: &Path,
     ) -> Result<InstallReport, String> {
-        let mut files = Vec::new();
-        files.push((
-            codex_config.display().to_string(),
-            with_action(codex_config, || self.remove_codex_user_config(codex_config))?,
-        ));
-        files.push((
-            claude_json.display().to_string(),
-            with_action(claude_json, || self.remove_claude_user_config(claude_json))?,
-        ));
+        let files = vec![
+            (
+                codex_config.display().to_string(),
+                with_action(codex_config, || self.remove_codex_user_config(codex_config))?,
+            ),
+            (
+                claude_json.display().to_string(),
+                with_action(claude_json, || self.remove_claude_user_config(claude_json))?,
+            ),
+        ];
         Ok(InstallReport {
             root: codex_config
                 .parent()
@@ -1833,7 +1835,7 @@ mod tests {
             .header("X.Weird+Name", "v")
             .header("Authorization", "Bearer t");
         let rendered = render_codex_server(&server);
-        let full = format!("{rendered}");
+        let full = rendered.to_string();
         let doc: toml::Table = full.parse().expect("odd header names keep the file valid");
         let headers = doc["mcp_servers"]["todo"]["http_headers"]
             .as_table()
