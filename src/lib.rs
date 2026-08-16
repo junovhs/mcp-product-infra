@@ -23,7 +23,7 @@ pub mod types;
 pub use activity::{ActivityLease, ActivityView};
 pub use adapters::{
     AdapterAction, ClaudeHook, HostConfigFact, HostInstall, HostReadinessReport, HostServer,
-    InstallReport,
+    HostTransport, InstallReport,
 };
 pub use manifest::{
     HandlerCommand, HandlerRequest, HandlerResponse, Manifest, ManifestDefect, ManifestMutation,
