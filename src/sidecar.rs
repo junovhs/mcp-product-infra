@@ -1770,6 +1770,52 @@ mod tests {
         SidecarConfig::new("testapp", dir, dir.join("cache")).app_version("1.2.3")
     }
 
+    /// How long a post-release lock assertion waits before giving up.
+    ///
+    /// `flock(2)` locks bind to the open file description, and any sibling test
+    /// that spawns a process `fork()`s a child which inherits a duplicate
+    /// reference to whatever descriptions are open at that instant — including a
+    /// lock this test still holds. `O_CLOEXEC` closes the child's copy at `exec`,
+    /// but between `fork` and `exec` the description stays referenced, so a
+    /// `drop` here does not release the lock until that window closes. Probing
+    /// once therefore fails a few percent of runs for a reason that has nothing
+    /// to do with the singleton being tested; a real owner holds its fd for the
+    /// process lifetime and never meets this.
+    const LOCK_RELEASE_GRACE: Duration = Duration::from_secs(2);
+
+    /// Acquire within [`LOCK_RELEASE_GRACE`], polling. Only for assertions that a
+    /// lock has become FREE — never for asserting it is held, where a single
+    /// probe is the stronger claim and a retry would weaken it.
+    fn acquire_within_grace(cfg: &SidecarConfig) -> Option<OwnerLock> {
+        let deadline = Instant::now() + LOCK_RELEASE_GRACE;
+        loop {
+            if let Some(lock) = OwnerLock::try_acquire(cfg).unwrap() {
+                return Some(lock);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The `flock(1)` analogue of [`acquire_within_grace`]: did an external
+    /// process manage to take the lock before the deadline?
+    fn external_flock_within_grace(path: &Path) -> bool {
+        let deadline = Instant::now() + LOCK_RELEASE_GRACE;
+        loop {
+            let taken = Command::new("flock")
+                .args(["-n", path.to_str().unwrap(), "-c", "true"])
+                .status()
+                .expect("run flock(1)")
+                .success();
+            if taken || Instant::now() >= deadline {
+                return taken;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// A hand-rolled owner that answers every request with `reply`, bypassing
     /// this build's control plane entirely — the stand-in for an owner built
     /// before `owner/health` existed, where the method reaches the app handler.
@@ -1848,7 +1894,8 @@ mod tests {
             "a second owner must be refused while the first lives"
         );
         drop(first);
-        let third = OwnerLock::try_acquire(&cfg).unwrap();
+        // Free-again is asserted with a grace window: see LOCK_RELEASE_GRACE.
+        let third = acquire_within_grace(&cfg);
         assert!(third.is_some(), "a released lock is takeable again");
     }
 
@@ -1956,13 +2003,10 @@ mod tests {
         );
 
         drop(held);
-        // After we release (the crash/exit analogue), another process can take it.
-        let free = Command::new("flock")
-            .args(["-n", path.to_str().unwrap(), "-c", "true"])
-            .status()
-            .expect("run flock(1)");
+        // After we release (the crash/exit analogue), another process can take
+        // it — within a grace window, see LOCK_RELEASE_GRACE.
         assert!(
-            free.success(),
+            external_flock_within_grace(&path),
             "after the holder releases, the lock is available again (crash-safe re-election)"
         );
     }
