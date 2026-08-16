@@ -34,10 +34,65 @@ pub enum HostTransport {
     },
 }
 
+/// A host whose config this crate writes.
+///
+/// ADPT-05: hosts are named rather than implied so a server can be declared for
+/// one and withheld from another. Before this existed, `install_repo` wrote every
+/// server to every host file, which is only safe when the hosts compose their
+/// scopes the same way — and they do not (see [`ScopeComposition`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Host {
+    ClaudeCode,
+    Codex,
+}
+
+/// How a host combines its user-scope and repo-scope entry for the same server.
+///
+/// This is the rule that makes per-host declaration necessary, so it is modelled
+/// explicitly instead of living in a comment: getting it wrong is silent, and the
+/// symptom (a host that cannot connect) does not point back at the config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScopeComposition {
+    /// Codex: the two entries merge field-wise. A repo entry may safely omit what
+    /// the user entry supplies — a tokenless repo entry still authenticates with
+    /// the user scope's `Authorization` header.
+    Merge,
+    /// Claude Code: the repo entry replaces the user entry wholesale. Anything the
+    /// repo entry omits is simply absent, so a tokenless repo entry connects with
+    /// no credential and is refused — even when a good user-scope entry exists.
+    /// A credentialed server therefore belongs in a per-project registration
+    /// ([`HostInstall::install_user_project_at`]), not in a tracked repo file.
+    Replace,
+}
+
+impl Host {
+    pub fn scope_composition(self) -> ScopeComposition {
+        match self {
+            Host::ClaudeCode => ScopeComposition::Replace,
+            Host::Codex => ScopeComposition::Merge,
+        }
+    }
+}
+
+fn all_hosts() -> BTreeSet<Host> {
+    BTreeSet::from([Host::ClaudeCode, Host::Codex])
+}
+
+/// Build one of these with [`HostServer::stdio`] or [`HostServer::http`] and the
+/// chaining setters — it is `#[non_exhaustive]` because scope state like
+/// `repo_hosts` must stay internally consistent, and because a struct literal
+/// downstream would break on every field added here (ADPT-05 added one).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HostServer {
     pub name: String,
     pub transport: HostTransport,
+    /// Hosts this server is written to at *repository* scope. Defaults to every
+    /// host; narrow it with [`HostServer::repo_scope_hosts`] when a host's
+    /// [`ScopeComposition`] makes a tracked repo entry harmful. User and
+    /// per-project scopes are selected by which install call you make, so this
+    /// governs `install_repo` only.
+    pub repo_hosts: BTreeSet<Host>,
     /// Earlier registrations of this same server that this one replaces. An entry
     /// matching any of these still counts as ours, so switching transports is a
     /// migration rather than a collision with a stranger's config. Declared
@@ -59,6 +114,7 @@ impl HostServer {
                 command: command.into(),
                 args: args.into_iter().map(Into::into).collect(),
             },
+            repo_hosts: all_hosts(),
             superseded: Vec::new(),
             env: BTreeMap::new(),
             codex_approval_tools: Vec::new(),
@@ -74,6 +130,7 @@ impl HostServer {
                 url: url.into(),
                 headers: BTreeMap::new(),
             },
+            repo_hosts: all_hosts(),
             superseded: Vec::new(),
             env: BTreeMap::new(),
             codex_approval_tools: Vec::new(),
@@ -87,6 +144,24 @@ impl HostServer {
             headers.insert(key.into(), value.into());
         }
         self
+    }
+
+    /// Restrict which hosts receive this server at repository scope.
+    ///
+    /// The default is every host. Narrow it when a tracked repo entry would be
+    /// wrong for a host — most often a credentialed HTTP server under a
+    /// [`ScopeComposition::Replace`] host, where the repo entry would shadow a
+    /// working user-scope entry with an unauthenticated one, and where writing the
+    /// credential into the repo file instead would commit a secret.
+    ///
+    /// An empty set means the server is written at no repository scope at all.
+    pub fn repo_scope_hosts(mut self, hosts: impl IntoIterator<Item = Host>) -> Self {
+        self.repo_hosts = hosts.into_iter().collect();
+        self
+    }
+
+    fn writes_to_repo_scope(&self, host: Host) -> bool {
+        self.repo_hosts.contains(&host)
     }
 
     /// Declare an earlier registration this server replaces, so `enable` migrates
@@ -243,6 +318,21 @@ impl HostInstall {
         })
     }
 
+    /// The servers written to `host` at repository scope, in declaration order.
+    fn repo_servers_for(&self, host: Host) -> impl Iterator<Item = &HostServer> {
+        self.servers
+            .iter()
+            .filter(move |server| server.writes_to_repo_scope(host))
+    }
+
+    /// The servers deliberately withheld from `host` at repository scope. An
+    /// install must sweep these, because a previous install may have written them.
+    fn excluded_repo_servers_for(&self, host: Host) -> impl Iterator<Item = &HostServer> {
+        self.servers
+            .iter()
+            .filter(move |server| !server.writes_to_repo_scope(host))
+    }
+
     pub fn install_user(&self) -> Result<InstallReport, String> {
         let paths = default_user_config_paths();
         self.install_user_at(&paths.codex_config, &paths.claude_json)
@@ -276,6 +366,60 @@ impl HostInstall {
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_default(),
+            files,
+        })
+    }
+
+    /// Materialize a Claude Code registration scoped to one project.
+    ///
+    /// Claude Code keys per-project MCP servers by canonical repository root under
+    /// `projects.<root>.mcpServers` in `~/.claude.json`. That file is private and
+    /// untracked, which makes it the only scope where a repo-specific entry can
+    /// carry a credential: the tracked `.mcp.json` would both leak the secret and,
+    /// under [`ScopeComposition::Replace`], shadow the user scope when it omits it.
+    ///
+    /// Only the named project's `mcpServers` map is touched. The top-level
+    /// `mcpServers` map, every other project, and every other key inside this
+    /// project (Claude keeps unrelated per-project state there) are preserved.
+    pub fn install_user_project(&self, project_root: &Path) -> Result<InstallReport, String> {
+        let paths = default_user_config_paths();
+        self.install_user_project_at(&paths.claude_json, project_root)
+    }
+
+    /// [`HostInstall::install_user_project`] against an explicit `~/.claude.json`.
+    pub fn install_user_project_at(
+        &self,
+        claude_json: &Path,
+        project_root: &Path,
+    ) -> Result<InstallReport, String> {
+        let key = project_scope_key(project_root);
+        let files = vec![(
+            format!("{} [{}]", claude_json.display(), key),
+            with_action(claude_json, || {
+                self.ensure_claude_project_config(claude_json, &key)
+            })?,
+        )];
+        Ok(InstallReport {
+            root: project_root.to_path_buf(),
+            files,
+        })
+    }
+
+    /// Remove only owned per-project Claude registrations for `project_root`.
+    pub fn remove_user_project_at(
+        &self,
+        claude_json: &Path,
+        project_root: &Path,
+    ) -> Result<InstallReport, String> {
+        let key = project_scope_key(project_root);
+        let files = vec![(
+            format!("{} [{}]", claude_json.display(), key),
+            with_action(claude_json, || {
+                self.remove_claude_project_config(claude_json, &key)
+            })?,
+        )];
+        Ok(InstallReport {
+            root: project_root.to_path_buf(),
             files,
         })
     }
@@ -330,14 +474,27 @@ impl HostInstall {
             build_readiness(
                 "Claude Code",
                 inspect_claude_config(claude_json, &self.servers),
-                inspect_claude_config(&repo_root.join(".mcp.json"), &self.servers),
+                inspect_claude_config(
+                    &repo_root.join(".mcp.json"),
+                    &self.repo_expected(Host::ClaudeCode),
+                ),
             ),
             build_readiness(
                 "Codex",
                 inspect_codex_config(codex_config, &self.servers),
-                inspect_codex_config(&repo_root.join(".codex/config.toml"), &self.servers),
+                inspect_codex_config(
+                    &repo_root.join(".codex/config.toml"),
+                    &self.repo_expected(Host::Codex),
+                ),
             ),
         ]
+    }
+
+    /// What a host's repository adapter is expected to contain. Readiness must ask
+    /// the same question the install answers, or a server deliberately withheld from
+    /// a host reads as drift and a healthy user registration reads as needing setup.
+    fn repo_expected(&self, host: Host) -> Vec<HostServer> {
+        self.repo_servers_for(host).cloned().collect()
     }
 
     /// Report readiness when user/global registrations intentionally launch a
@@ -355,12 +512,18 @@ impl HostInstall {
             build_readiness(
                 "Claude Code",
                 inspect_claude_config(claude_json, &user_install.servers),
-                inspect_claude_config(&repo_root.join(".mcp.json"), &self.servers),
+                inspect_claude_config(
+                    &repo_root.join(".mcp.json"),
+                    &self.repo_expected(Host::ClaudeCode),
+                ),
             ),
             build_readiness(
                 "Codex",
                 inspect_codex_config(codex_config, &user_install.servers),
-                inspect_codex_config(&repo_root.join(".codex/config.toml"), &self.servers),
+                inspect_codex_config(
+                    &repo_root.join(".codex/config.toml"),
+                    &self.repo_expected(Host::Codex),
+                ),
             ),
         ]
     }
@@ -389,7 +552,7 @@ impl HostInstall {
                 ".mcp.json `mcpServers` is not an object".to_string(),
             ));
         };
-        for server in &self.servers {
+        for server in self.repo_servers_for(Host::ClaudeCode) {
             match servers.get(&server.name) {
                 // Already exactly what we write: nothing to do.
                 Some(existing) if claude_entry_is_current(existing, server) => {}
@@ -403,6 +566,18 @@ impl HostInstall {
                 None => {
                     servers.insert(server.name.clone(), claude_server_json(server));
                 }
+            }
+        }
+        // Converge an installation that predates the host restriction: an entry we
+        // wrote before still shadows the user scope, so withholding the server from
+        // this host has to remove it, not merely stop writing it. Only ever an entry
+        // that is provably ours.
+        for server in self.excluded_repo_servers_for(Host::ClaudeCode) {
+            if servers
+                .get(&server.name)
+                .is_some_and(|existing| claude_server_is_owned(existing, server))
+            {
+                servers.remove(&server.name);
             }
         }
         write_json(&path, &doc)?;
@@ -425,7 +600,7 @@ impl HostInstall {
         // and foreign servers survive, which reserializing the document would not.
         let mut text = existing;
         let mut migrated = false;
-        for server in &self.servers {
+        for server in self.repo_servers_for(Host::Codex) {
             let existing_entry = table
                 .get("mcp_servers")
                 .and_then(|v| v.as_table())
@@ -449,6 +624,24 @@ impl HostInstall {
                 migrated = true;
             }
         }
+        // Symmetric convergence: drop an owned block for a server this host no
+        // longer receives, so narrowing the host set repairs existing installs
+        // instead of leaving the old entry behind.
+        for server in self.excluded_repo_servers_for(Host::Codex) {
+            let owned = table
+                .get("mcp_servers")
+                .and_then(|v| v.as_table())
+                .and_then(|servers| servers.get(&server.name))
+                .is_some_and(|entry| codex_server_is_owned(entry, server));
+            if !owned {
+                continue;
+            }
+            if let Some(updated) = replace_codex_server_block(&text, &server.name, "") {
+                text = updated;
+                migrated = true;
+            }
+        }
+
         let table = if migrated {
             match parse_toml_materialized(&text, ".codex/config.toml") {
                 Ok(table) => table,
@@ -459,7 +652,7 @@ impl HostInstall {
         };
 
         let mut additions = String::new();
-        for server in &self.servers {
+        for server in self.repo_servers_for(Host::Codex) {
             append_codex_server(&table, &mut additions, server);
         }
         if additions.is_empty() && !migrated {
@@ -565,18 +758,92 @@ impl HostInstall {
                 "Claude `mcpServers` is not an object".to_string(),
             ));
         };
-        for server in &self.servers {
-            if let Some(existing) = servers.get(&server.name) {
-                if !claude_server_is_owned(existing, server) {
-                    return Ok(Materialized::Skipped(format!(
-                        "Claude already has a non-owned `{}` MCP server; leaving it untouched",
-                        server.name
-                    )));
-                }
-            }
-            servers.insert(server.name.clone(), claude_server_json(server));
+        if let Some(skipped) = upsert_claude_servers(servers, &self.servers) {
+            return Ok(skipped);
         }
         write_json(path, &doc)?;
+        Ok(Materialized::Wrote)
+    }
+
+    /// Write this install's servers into `projects.<key>.mcpServers`, creating the
+    /// project entry when absent and disturbing nothing else in the file.
+    fn ensure_claude_project_config(&self, path: &Path, key: &str) -> Result<Materialized, String> {
+        let mut doc = match fs::read_to_string(path) {
+            // Only a genuinely absent file starts from an empty document. A file we
+            // cannot read (invalid UTF-8, permissions) is reported, never replaced —
+            // treating it as absent would overwrite the user's whole config.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+            Err(e) => {
+                return Ok(Materialized::Skipped(format!(
+                    "{} could not be read: {e}",
+                    path.display()
+                )))
+            }
+            Ok(existing) => match serde_json::from_str::<Value>(&existing) {
+                Ok(v) if v.is_object() => v,
+                _ => {
+                    return Ok(Materialized::Skipped(format!(
+                        "{} is not parseable JSON",
+                        path.display()
+                    )))
+                }
+            },
+        };
+        let Some(root) = doc.as_object_mut() else {
+            return Ok(Materialized::Skipped(
+                "Claude config is not an object".to_string(),
+            ));
+        };
+        let projects = root.entry("projects").or_insert_with(|| json!({}));
+        let Some(projects) = projects.as_object_mut() else {
+            return Ok(Materialized::Skipped(
+                "Claude `projects` is not an object".to_string(),
+            ));
+        };
+        // Preserve any unrelated per-project state Claude keeps beside `mcpServers`.
+        let project = projects.entry(key.to_string()).or_insert_with(|| json!({}));
+        let Some(project) = project.as_object_mut() else {
+            return Ok(Materialized::Skipped(format!(
+                "Claude project entry for {key} is not an object"
+            )));
+        };
+        let servers = project.entry("mcpServers").or_insert_with(|| json!({}));
+        let Some(servers) = servers.as_object_mut() else {
+            return Ok(Materialized::Skipped(format!(
+                "Claude `mcpServers` for project {key} is not an object"
+            )));
+        };
+        if let Some(skipped) = upsert_claude_servers(servers, &self.servers) {
+            return Ok(skipped);
+        }
+        write_json(path, &doc)?;
+        Ok(Materialized::Wrote)
+    }
+
+    fn remove_claude_project_config(&self, path: &Path, key: &str) -> Result<Materialized, String> {
+        let existing = match fs::read_to_string(path) {
+            Ok(v) => v,
+            Err(_) => return Ok(Materialized::Skipped("not present".to_string())),
+        };
+        let mut doc = match serde_json::from_str::<Value>(&existing) {
+            Ok(v) if v.is_object() => v,
+            _ => {
+                return Ok(Materialized::Skipped(format!(
+                    "{} is not parseable JSON",
+                    path.display()
+                )))
+            }
+        };
+        let changed = doc
+            .get_mut("projects")
+            .and_then(|v| v.as_object_mut())
+            .and_then(|projects| projects.get_mut(key))
+            .and_then(|project| project.get_mut("mcpServers"))
+            .and_then(|v| v.as_object_mut())
+            .is_some_and(|servers| remove_owned_claude_servers(servers, &self.servers));
+        if changed {
+            write_json(path, &doc)?;
+        }
         Ok(Materialized::Wrote)
     }
 
@@ -596,15 +863,7 @@ impl HostInstall {
         };
         let mut changed = false;
         if let Some(servers) = doc.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
-            for server in &self.servers {
-                if servers
-                    .get(&server.name)
-                    .is_some_and(|v| claude_server_is_owned(v, server))
-                {
-                    servers.remove(&server.name);
-                    changed = true;
-                }
-            }
+            changed = remove_owned_claude_servers(servers, &self.servers);
         }
         if changed {
             write_json(path, &doc)?;
@@ -857,10 +1116,14 @@ fn replace_codex_server_block(text: &str, name: &str, replacement: &str) -> Opti
                 found = true;
                 if !inserted {
                     inserted = true;
-                    for replacement_line in replacement.trim_end().lines() {
-                        out.push(replacement_line.to_string());
+                    // An empty replacement deletes the block. Emitting no separator
+                    // then leaves the surrounding blank lines as the user wrote them.
+                    if !replacement.trim_end().is_empty() {
+                        for replacement_line in replacement.trim_end().lines() {
+                            out.push(replacement_line.to_string());
+                        }
+                        out.push(String::new());
                     }
-                    out.push(String::new());
                 }
                 continue;
             }
@@ -964,6 +1227,59 @@ fn codex_server_toml(server: &HostServer) -> toml::Value {
         table.insert("tools".to_string(), toml::Value::Table(tools));
     }
     toml::Value::Table(table)
+}
+
+/// The key Claude Code files a project's config under: its canonical root path.
+///
+/// Canonicalization is best-effort — a root that does not exist yet is keyed by
+/// the path as given rather than failing the install.
+fn project_scope_key(project_root: &Path) -> String {
+    fs::canonicalize(project_root)
+        .unwrap_or_else(|_| project_root.to_path_buf())
+        .display()
+        .to_string()
+}
+
+/// Upsert every declared server into one Claude `mcpServers` map.
+///
+/// Returns `Some(Skipped)` when an entry under our name belongs to someone else:
+/// the map is left as it was and the caller writes nothing. Shared by the user and
+/// per-project scopes so both obey one ownership rule.
+fn upsert_claude_servers(
+    servers: &mut serde_json::Map<String, Value>,
+    declared: &[HostServer],
+) -> Option<Materialized> {
+    for server in declared {
+        if let Some(existing) = servers.get(&server.name) {
+            if !claude_server_is_owned(existing, server) {
+                return Some(Materialized::Skipped(format!(
+                    "Claude already has a non-owned `{}` MCP server; leaving it untouched",
+                    server.name
+                )));
+            }
+        }
+        servers.insert(server.name.clone(), claude_server_json(server));
+    }
+    None
+}
+
+/// Drop only owned entries from one Claude `mcpServers` map. Returns whether
+/// anything was removed.
+fn remove_owned_claude_servers(
+    servers: &mut serde_json::Map<String, Value>,
+    declared: &[HostServer],
+) -> bool {
+    let mut changed = false;
+    for server in declared {
+        if servers
+            .get(&server.name)
+            .is_some_and(|v| claude_server_is_owned(v, server))
+        {
+            servers.remove(&server.name);
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn claude_server_json(server: &HostServer) -> Value {
@@ -2167,5 +2483,356 @@ mod tests {
         // The dotted name stays one literal key rather than becoming a nested table.
         assert_eq!(headers["X.Weird+Name"].as_str(), Some("v"));
         assert_eq!(headers["Authorization"].as_str(), Some("Bearer t"));
+    }
+
+    /// ADPT-05 (1) — a server withheld from Claude Code reaches `.codex/config.toml`
+    /// and never `.mcp.json`. This is the whole point of per-host declaration: under
+    /// `ScopeComposition::Replace` a tracked, tokenless repo entry would shadow a
+    /// working user-scope entry and connect with no credential.
+    #[test]
+    fn a_codex_only_server_is_written_to_codex_and_absent_from_mcp_json() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let install = HostInstall::new("todo")
+            .server(
+                HostServer::http("todo", "http://127.0.0.1:7977/mcp")
+                    .repo_scope_hosts([Host::Codex]),
+            )
+            .server(HostServer::stdio("mapper", "mapper", ["mcp"]));
+        install.install_repo(dir.path()).unwrap();
+
+        let codex = fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
+        assert!(codex.contains("[mcp_servers.todo]"), "{codex}");
+        assert!(codex.contains("[mcp_servers.mapper]"), "{codex}");
+
+        let mcp: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap())
+                .unwrap();
+        let servers = mcp["mcpServers"].as_object().unwrap();
+        assert!(
+            !servers.contains_key("todo"),
+            "credentialed server must not reach the tracked repo file: {mcp}"
+        );
+        // An unrestricted server is unaffected — the default is still every host.
+        assert!(servers.contains_key("mapper"), "{mcp}");
+    }
+
+    /// ADPT-05 (2) — the per-project registration is the only scope that can carry a
+    /// credential for Claude Code, so it must land under the canonical root, keep its
+    /// headers, and leave the top-level map and every other project alone.
+    #[test]
+    fn a_per_project_claude_registration_lands_scoped_and_spares_other_entries() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let claude_json = home.path().join(".claude.json");
+        fs::write(
+            &claude_json,
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": { "todo": { "type": "http", "url": "http://127.0.0.1:7977/mcp" } },
+                "projects": {
+                    "/somewhere/else": { "mcpServers": { "todo": { "command": "keep-me" } } }
+                },
+                "someUnrelatedTopLevelKey": 42
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let install = HostInstall::new("todo").server(
+            HostServer::http("todo", "http://127.0.0.1:7977/mcp?root=/x")
+                .header("Authorization", "Bearer secret"),
+        );
+        let report = install
+            .install_user_project_at(&claude_json, repo.path())
+            .unwrap();
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.files[0].1, AdapterAction::Updated);
+
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        let key = project_scope_key(repo.path());
+        let entry = &doc["projects"][&key]["mcpServers"]["todo"];
+        assert_eq!(
+            entry["url"].as_str(),
+            Some("http://127.0.0.1:7977/mcp?root=/x")
+        );
+        assert_eq!(
+            entry["headers"]["Authorization"].as_str(),
+            Some("Bearer secret")
+        );
+        // Untouched: the user scope, a foreign project, and unrelated file state.
+        assert_eq!(
+            doc["mcpServers"]["todo"]["url"].as_str(),
+            Some("http://127.0.0.1:7977/mcp")
+        );
+        assert!(doc["mcpServers"]["todo"].get("headers").is_none());
+        assert_eq!(
+            doc["projects"]["/somewhere/else"]["mcpServers"]["todo"]["command"].as_str(),
+            Some("keep-me")
+        );
+        assert_eq!(doc["someUnrelatedTopLevelKey"].as_i64(), Some(42));
+    }
+
+    /// ADPT-05 (2, cont.) — per-project state Claude keeps beside `mcpServers`
+    /// survives, because we merge into the existing project object.
+    #[test]
+    fn a_per_project_registration_preserves_sibling_project_state() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let claude_json = home.path().join(".claude.json");
+        let key = project_scope_key(repo.path());
+        fs::write(
+            &claude_json,
+            serde_json::to_string(&json!({
+                "projects": { &key: { "history": ["a", "b"], "allowedTools": [] } }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        HostInstall::new("todo")
+            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"))
+            .install_user_project_at(&claude_json, repo.path())
+            .unwrap();
+
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert_eq!(doc["projects"][&key]["history"][1].as_str(), Some("b"));
+        assert!(doc["projects"][&key]["mcpServers"]["todo"].is_object());
+    }
+
+    /// ADPT-05 (3) — re-running must be a true no-op, byte for byte, or every
+    /// enable would churn the user's private config.
+    #[test]
+    fn re_running_a_per_project_registration_is_byte_identical() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let claude_json = home.path().join(".claude.json");
+        let install = HostInstall::new("todo").server(
+            HostServer::http("todo", "http://127.0.0.1:7977/mcp")
+                .header("Authorization", "Bearer t"),
+        );
+
+        let first = install
+            .install_user_project_at(&claude_json, repo.path())
+            .unwrap();
+        assert_eq!(first.files[0].1, AdapterAction::Created);
+        let after_first = fs::read(&claude_json).unwrap();
+
+        let second = install
+            .install_user_project_at(&claude_json, repo.path())
+            .unwrap();
+        assert_eq!(second.files[0].1, AdapterAction::Unchanged);
+        assert_eq!(after_first, fs::read(&claude_json).unwrap());
+    }
+
+    /// ADPT-05 (4) — a stranger's entry under our name at project scope is reported
+    /// and left exactly as it was, the same ownership rule the other scopes follow.
+    #[test]
+    fn a_foreign_per_project_entry_is_reported_and_left_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let claude_json = home.path().join(".claude.json");
+        let key = project_scope_key(repo.path());
+        let original = serde_json::to_string(&json!({
+            "projects": { &key: { "mcpServers": { "todo": { "command": "someone-elses" } } } }
+        }))
+        .unwrap();
+        fs::write(&claude_json, &original).unwrap();
+
+        let report = HostInstall::new("todo")
+            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"))
+            .install_user_project_at(&claude_json, repo.path())
+            .unwrap();
+
+        match &report.files[0].1 {
+            AdapterAction::Skipped(reason) => assert!(reason.contains("non-owned"), "{reason}"),
+            other => panic!("expected a skip, got {other:?}"),
+        }
+        assert_eq!(fs::read_to_string(&claude_json).unwrap(), original);
+    }
+
+    /// ADPT-05 (5) — removal reaches the per-project scope it wrote, and stops there.
+    #[test]
+    fn removal_cleans_the_per_project_scope_only() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let claude_json = home.path().join(".claude.json");
+        let install =
+            HostInstall::new("todo").server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"));
+        install
+            .install_user_at(&home.path().join("codex.toml"), &claude_json)
+            .unwrap();
+        install
+            .install_user_project_at(&claude_json, repo.path())
+            .unwrap();
+        let key = project_scope_key(repo.path());
+
+        install
+            .remove_user_project_at(&claude_json, repo.path())
+            .unwrap();
+
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert!(
+            doc["projects"][&key]["mcpServers"]
+                .as_object()
+                .unwrap()
+                .is_empty(),
+            "project scope should be cleaned: {doc}"
+        );
+        // The user scope is a different registration and is not swept by this call.
+        assert!(doc["mcpServers"]["todo"].is_object(), "{doc}");
+    }
+
+    /// ADPT-05 (6) — an unparseable config is reported and never overwritten.
+    #[test]
+    fn an_unparseable_claude_json_is_skipped_not_clobbered_at_project_scope() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let claude_json = home.path().join(".claude.json");
+        fs::write(&claude_json, "{ not json at all").unwrap();
+
+        let report = HostInstall::new("todo")
+            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"))
+            .install_user_project_at(&claude_json, repo.path())
+            .unwrap();
+
+        match &report.files[0].1 {
+            AdapterAction::Skipped(reason) => assert!(reason.contains("not parseable"), "{reason}"),
+            other => panic!("expected a skip, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read_to_string(&claude_json).unwrap(),
+            "{ not json at all"
+        );
+    }
+
+    /// ADPT-05 (review, P1) — the case that actually matters: an install that
+    /// already wrote the server to `.mcp.json` before it was withheld. Skipping it
+    /// would leave the shadowing entry in place, so every affected repo would stay
+    /// broken after the upgrade. Narrowing the host set must remove it.
+    #[test]
+    fn narrowing_the_host_set_removes_the_entry_a_previous_install_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let server = || HostServer::http("todo", "http://127.0.0.1:7977/mcp");
+
+        // The old install: every host, including the tracked repo files.
+        HostInstall::new("todo")
+            .server(server())
+            .install_repo(dir.path())
+            .unwrap();
+        let mcp: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap())
+                .unwrap();
+        assert!(mcp["mcpServers"]["todo"].is_object(), "precondition");
+
+        // The upgrade withholds it from Claude Code.
+        HostInstall::new("todo")
+            .server(server().repo_scope_hosts([Host::Codex]))
+            .install_repo(dir.path())
+            .unwrap();
+
+        let mcp: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap())
+                .unwrap();
+        assert!(
+            !mcp["mcpServers"].as_object().unwrap().contains_key("todo"),
+            "stale shadowing entry survived the upgrade: {mcp}"
+        );
+        let codex = fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
+        assert!(codex.contains("[mcp_servers.todo]"), "{codex}");
+    }
+
+    /// ADPT-05 (review, P1) — the symmetric Codex sweep, and it must spare a
+    /// foreign server and the user's own comments while doing it.
+    #[test]
+    fn narrowing_the_host_set_removes_an_owned_codex_block_and_spares_foreign_config() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let server = || HostServer::http("todo", "http://127.0.0.1:7977/mcp");
+        HostInstall::new("todo")
+            .server(server())
+            .server(HostServer::stdio("other", "other", ["serve"]))
+            .install_repo(dir.path())
+            .unwrap();
+
+        HostInstall::new("todo")
+            .server(server().repo_scope_hosts([Host::ClaudeCode]))
+            .server(HostServer::stdio("other", "other", ["serve"]))
+            .install_repo(dir.path())
+            .unwrap();
+
+        let codex = fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
+        assert!(
+            !codex.contains("[mcp_servers.todo]"),
+            "owned block should be swept: {codex}"
+        );
+        assert!(codex.contains("[mcp_servers.other]"), "{codex}");
+        let mcp: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap())
+                .unwrap();
+        assert!(mcp["mcpServers"]["todo"].is_object(), "{mcp}");
+    }
+
+    /// ADPT-05 (review, P1) — a file that exists but cannot be read is reported,
+    /// never treated as absent and overwritten with a fresh document.
+    #[test]
+    fn an_unreadable_claude_json_is_reported_not_replaced() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let claude_json = home.path().join(".claude.json");
+        // Invalid UTF-8: present and openable, but not readable as a string.
+        fs::write(&claude_json, [0x7b, 0xff, 0xfe, 0x7d]).unwrap();
+
+        let report = HostInstall::new("todo")
+            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"))
+            .install_user_project_at(&claude_json, repo.path())
+            .unwrap();
+
+        match &report.files[0].1 {
+            AdapterAction::Skipped(reason) => {
+                assert!(reason.contains("could not be read"), "{reason}")
+            }
+            other => panic!("expected a skip, got {other:?}"),
+        }
+        assert_eq!(fs::read(&claude_json).unwrap(), [0x7b, 0xff, 0xfe, 0x7d]);
+    }
+
+    /// ADPT-05 (review, P2) — readiness must ask what the install answers. A server
+    /// withheld from Claude Code is not drift, and must not drag the host's
+    /// readiness down when the user registration is good.
+    #[test]
+    fn readiness_does_not_call_a_withheld_repo_server_drift() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let codex_config = home.path().join("codex.toml");
+        let claude_json = home.path().join(".claude.json");
+
+        let install = HostInstall::new("todo").server(
+            HostServer::http("todo", "http://127.0.0.1:7977/mcp").repo_scope_hosts([Host::Codex]),
+        );
+        install.install_repo(dir.path()).unwrap();
+        install
+            .install_user_at(&codex_config, &claude_json)
+            .unwrap();
+
+        let reports = install.readiness_at(dir.path(), &codex_config, &claude_json);
+        let claude = reports.iter().find(|r| r.host == "Claude Code").unwrap();
+        assert_ne!(
+            claude.repository_adapter.state, "drifted",
+            "a deliberately withheld server is not drift: {claude:?}"
+        );
+        assert!(claude.ready, "user registration is good: {claude:?}");
+    }
+
+    /// ADPT-05 — the composition rule is the reason the rest of this exists, so it
+    /// is asserted rather than left to prose.
+    #[test]
+    fn hosts_declare_how_they_compose_scopes() {
+        assert_eq!(
+            Host::ClaudeCode.scope_composition(),
+            ScopeComposition::Replace
+        );
+        assert_eq!(Host::Codex.scope_composition(), ScopeComposition::Merge);
     }
 }
