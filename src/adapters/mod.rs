@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -392,7 +392,7 @@ impl HostInstall {
         for server in &self.servers {
             match servers.get(&server.name) {
                 // Already exactly what we write: nothing to do.
-                Some(existing) if claude_matches_transport(existing, &server.transport) => {}
+                Some(existing) if claude_entry_is_current(existing, server) => {}
                 // Ours, but an earlier registration we have declared superseded —
                 // migrate it in place rather than leaving the stale transport.
                 Some(existing) if claude_server_is_owned(existing, server) => {
@@ -436,8 +436,9 @@ impl HostInstall {
             let Some(entry_table) = entry.as_table() else {
                 continue;
             };
-            if codex_matches_transport(entry_table, &server.transport)
-                || !codex_server_is_owned(entry, server)
+            // Skip only an entry that is already exactly what we write. One that
+            // is ours but carries stale keys falls through to be replaced.
+            if codex_entry_is_current(entry_table, server) || !codex_server_is_owned(entry, server)
             {
                 continue;
             }
@@ -1098,6 +1099,74 @@ fn claude_server_is_owned(value: &Value, expected: &HostServer) -> bool {
             .any(|previous| claude_matches_transport(value, previous))
 }
 
+/// The exact top-level keys the current rendering emits for `server`.
+///
+/// Ownership and currency are different questions. `codex_matches_transport` /
+/// `claude_matches_transport` answer "is this entry ours?" from transport
+/// identity alone — deliberately, because an HTTP entry's header values hold a
+/// credential rotated independently of the config, so comparing them would make
+/// every rotation read as foreign drift. But an entry can be ours and still
+/// carry keys we no longer write. Comparing the key SET closes that gap without
+/// reintroducing value comparison on the parts that legitimately move.
+fn expected_codex_keys(server: &HostServer) -> BTreeSet<&'static str> {
+    let mut keys = BTreeSet::new();
+    match &server.transport {
+        HostTransport::Stdio { .. } => {
+            keys.insert("command");
+            keys.insert("args");
+        }
+        HostTransport::Http { headers, .. } => {
+            keys.insert("url");
+            if !headers.is_empty() {
+                keys.insert("http_headers");
+            }
+        }
+    }
+    if !server.codex_approval_tools.is_empty() {
+        keys.insert("tools");
+    }
+    keys
+}
+
+fn expected_claude_keys(server: &HostServer) -> BTreeSet<&'static str> {
+    let mut keys = BTreeSet::new();
+    match &server.transport {
+        HostTransport::Stdio { .. } => {
+            keys.insert("command");
+            keys.insert("args");
+        }
+        HostTransport::Http { headers, .. } => {
+            keys.insert("type");
+            keys.insert("url");
+            if !headers.is_empty() {
+                keys.insert("headers");
+            }
+        }
+    }
+    if !server.env.is_empty() {
+        keys.insert("env");
+    }
+    keys
+}
+
+/// Is this entry already exactly the registration we write today — same
+/// transport AND no key beyond what we emit? An owned entry that fails this is
+/// stale and must be rewritten, so `install_repo` converges on our rendering
+/// instead of merely being satisfied by it.
+fn codex_entry_is_current(table: &toml::Table, server: &HostServer) -> bool {
+    codex_matches_transport(table, &server.transport)
+        && table.keys().map(String::as_str).collect::<BTreeSet<_>>() == expected_codex_keys(server)
+}
+
+fn claude_entry_is_current(value: &Value, server: &HostServer) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    claude_matches_transport(value, &server.transport)
+        && object.keys().map(String::as_str).collect::<BTreeSet<_>>()
+            == expected_claude_keys(server)
+}
+
 fn command_name_matches(actual: &str, expected: &str) -> bool {
     actual == expected
         || Path::new(actual).file_name().and_then(|name| name.to_str())
@@ -1399,6 +1468,143 @@ mod tests {
         assert!(dir.path().join(".mcp.json").exists());
         assert!(dir.path().join(".codex/config.toml").exists());
         assert!(dir.path().join("CLAUDE.md").exists());
+    }
+
+    /// ADPT-04 — the exact live case: a repo `.codex/config.toml` carrying our
+    /// URL plus an `http_headers` table left over from when the credential lived
+    /// at repo scope. Ownership matched on the URL, so the entry read as current
+    /// and the stale bearer token survived every re-run of enable.
+    #[test]
+    fn a_repo_codex_entry_with_stale_headers_converges_and_spares_foreign_config() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        fs::write(
+            dir.path().join(".codex/config.toml"),
+            concat!(
+                "# a comment the user wrote\n",
+                "[mcp_servers.other]\n",
+                "command = \"other\"\n",
+                "args = [\"serve\"]\n",
+                "\n",
+                "[mcp_servers.todo]\n",
+                "url = \"http://127.0.0.1:7977/mcp\"\n",
+                "\n",
+                "[mcp_servers.todo.http_headers]\n",
+                "\"Authorization\" = \"Bearer leaked-token\"\n",
+            ),
+        )
+        .unwrap();
+
+        // Repo scope carries no token, so `http_headers` is a key we no longer emit.
+        HostInstall::new("todo")
+            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"))
+            .install_repo(dir.path())
+            .unwrap();
+
+        let raw = fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
+        let doc: toml::Table = raw.parse().expect("codex config stays valid TOML");
+        let entry = doc["mcp_servers"]["todo"].as_table().unwrap();
+        assert_eq!(entry["url"].as_str(), Some("http://127.0.0.1:7977/mcp"));
+        assert!(
+            !entry.contains_key("http_headers"),
+            "the stale header table must be gone: {raw}"
+        );
+        assert!(
+            !raw.contains("leaked-token"),
+            "no trace of the stale credential: {raw}"
+        );
+        // Foreign server and user comment are untouched.
+        assert_eq!(
+            doc["mcp_servers"]["other"]["command"].as_str(),
+            Some("other")
+        );
+        assert!(raw.contains("# a comment the user wrote"), "{raw}");
+
+        // Converged: a second run is a byte-identical no-op.
+        HostInstall::new("todo")
+            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"))
+            .install_repo(dir.path())
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap(),
+            raw,
+            "re-running over a converged file must change nothing"
+        );
+    }
+
+    /// The `.mcp.json` half of the same defect.
+    #[test]
+    fn a_repo_mcp_json_entry_with_extra_keys_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(
+            dir.path().join(".mcp.json"),
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "other": { "command": "other", "args": ["serve"] },
+                    "todo": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:7977/mcp",
+                        "headers": { "Authorization": "Bearer leaked-token" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        HostInstall::new("todo")
+            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"))
+            .install_repo(dir.path())
+            .unwrap();
+
+        let raw = fs::read_to_string(dir.path().join(".mcp.json")).unwrap();
+        let doc: Value = serde_json::from_str(&raw).unwrap();
+        let entry = &doc["mcpServers"]["todo"];
+        assert_eq!(entry["url"], "http://127.0.0.1:7977/mcp");
+        assert_eq!(entry["type"], "http");
+        assert!(entry.get("headers").is_none(), "stale headers gone: {raw}");
+        assert!(!raw.contains("leaked-token"), "{raw}");
+        // A foreign entry under a different name is never rewritten.
+        assert_eq!(doc["mcpServers"]["other"]["command"], "other");
+
+        HostInstall::new("todo")
+            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"))
+            .install_repo(dir.path())
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".mcp.json")).unwrap(),
+            raw,
+            "second run is a no-op"
+        );
+    }
+
+    /// The rotation rationale must survive: when we DO emit headers, an entry
+    /// whose header value differs is still ours and still current — comparing
+    /// the value would make every credential rotation read as foreign drift.
+    #[test]
+    fn a_rotated_header_value_does_not_make_an_entry_stale() {
+        let server = HostServer::http("todo", "http://127.0.0.1:7977/mcp")
+            .header("Authorization", "Bearer new");
+        let entry: toml::Table = concat!(
+            "url = \"http://127.0.0.1:7977/mcp\"\n",
+            "[http_headers]\n",
+            "\"Authorization\" = \"Bearer old\"\n",
+        )
+        .parse()
+        .unwrap();
+        assert!(
+            codex_entry_is_current(&entry, &server),
+            "a rotated token is not drift"
+        );
+
+        let claude = json!({
+            "type": "http",
+            "url": "http://127.0.0.1:7977/mcp",
+            "headers": { "Authorization": "Bearer old" }
+        });
+        assert!(claude_entry_is_current(&claude, &server));
     }
 
     /// ADPT-03 — a repo carrying a stray regular file named `.codex` used to make
