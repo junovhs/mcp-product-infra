@@ -1,6 +1,5 @@
 [mcp_servers.ishoo]
-command = "ishoo"
-args = ["mcp"]
+url = "http://127.0.0.1:7977/mcp"
 
 [mcp_servers.ishoo.tools.ishoo_candidates]
 approval_mode = "approve"
