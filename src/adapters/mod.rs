@@ -411,6 +411,9 @@ impl HostInstall {
 
     fn ensure_codex_repo_config(&self, repo_root: &Path) -> Result<Materialized, String> {
         let dir = repo_root.join(".codex");
+        if let Some(skipped) = unusable_directory(&dir) {
+            return Ok(skipped);
+        }
         let path = dir.join("config.toml");
         let existing = fs::read_to_string(&path).unwrap_or_default();
         let table = match parse_toml_materialized(&existing, ".codex/config.toml") {
@@ -890,6 +893,27 @@ fn toml_path_exists(table: &toml::Table, path: &[&str]) -> bool {
         };
     }
     value.as_table().is_some()
+}
+
+/// Is something already occupying `dir` that is not a directory we can write into?
+///
+/// `create_dir_all` reports that as `File exists (os error 17)`, and an `Err` out
+/// of one adapter aborts the whole `install_repo` run, so a single stray path
+/// costs the caller every other adapter file. Detecting it here keeps the failure
+/// at file level, matching this module's policy that an unusable file is reported
+/// as `Skipped` and never overwritten — we do not own it, so we do not remove it.
+///
+/// Checked through `symlink_metadata` so a dangling symlink (which `exists()`
+/// reports as absent, yet `create_dir_all` still refuses) is caught, while a
+/// symlink pointing at a real directory is left to proceed normally.
+fn unusable_directory(dir: &Path) -> Option<Materialized> {
+    if dir.is_dir() || fs::symlink_metadata(dir).is_err() {
+        return None;
+    }
+    Some(Materialized::Skipped(format!(
+        "{} exists but is not a directory; leaving it untouched",
+        dir.display()
+    )))
 }
 
 fn parse_toml_materialized(existing: &str, label: &str) -> Result<toml::Table, Materialized> {
@@ -1375,6 +1399,100 @@ mod tests {
         assert!(dir.path().join(".mcp.json").exists());
         assert!(dir.path().join(".codex/config.toml").exists());
         assert!(dir.path().join("CLAUDE.md").exists());
+    }
+
+    /// ADPT-03 — a repo carrying a stray regular file named `.codex` used to make
+    /// `create_dir_all` fail with `File exists`, and that error aborted the entire
+    /// run, so the caller got nothing at all. One unusable path must cost only its
+    /// own file.
+    #[test]
+    fn a_stray_file_at_dot_codex_skips_only_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".codex"), "").unwrap();
+
+        let report = HostInstall::new("todo")
+            .server(HostServer::stdio("todo", "todo", ["mcp"]))
+            .managed_markdown_body("Use todo_* MCP tools.")
+            .claude_allow("Bash(todo *)")
+            .install_repo(dir.path())
+            .expect("a stray .codex must not abort the run");
+
+        let codex = report
+            .files
+            .iter()
+            .find(|(name, _)| name == ".codex/config.toml")
+            .map(|(_, action)| action)
+            .expect("the codex entry is still reported");
+        let AdapterAction::Skipped(reason) = codex else {
+            panic!("expected the codex adapter to be skipped, got {codex:?}");
+        };
+        assert!(
+            reason.contains(".codex"),
+            "the reason names the offending path: {reason}"
+        );
+
+        // Every other adapter still materialized.
+        for name in [
+            ".mcp.json",
+            ".claude/settings.local.json",
+            ".claude/.gitignore",
+            "CLAUDE.md",
+            "AGENTS.md",
+        ] {
+            assert!(
+                dir.path().join(name).exists(),
+                "{name} must still be written"
+            );
+        }
+        // The stray file is left exactly as we found it — we do not own it.
+        assert!(dir.path().join(".codex").is_file());
+    }
+
+    /// A dangling symlink is the same failure wearing a different hat: `exists()`
+    /// follows the link and reports absent, yet `create_dir_all` still refuses.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_at_dot_codex_skips_only_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), dir.path().join(".codex")).unwrap();
+
+        let report = HostInstall::new("todo")
+            .server(HostServer::stdio("todo", "todo", ["mcp"]))
+            .install_repo(dir.path())
+            .expect("a dangling .codex symlink must not abort the run");
+
+        let codex = report
+            .files
+            .iter()
+            .find(|(name, _)| name == ".codex/config.toml")
+            .map(|(_, action)| action)
+            .expect("the codex entry is still reported");
+        assert!(
+            matches!(codex, AdapterAction::Skipped(_)),
+            "expected skipped, got {codex:?}"
+        );
+        assert!(dir.path().join(".mcp.json").exists());
+    }
+
+    /// The guard must not fire on the ordinary case it resembles: a symlink that
+    /// points at a real directory is perfectly writable.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_dot_codex_directory_still_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let real = dir.path().join("elsewhere");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join(".codex")).unwrap();
+
+        HostInstall::new("todo")
+            .server(HostServer::stdio("todo", "todo", ["mcp"]))
+            .install_repo(dir.path())
+            .unwrap();
+
+        assert!(real.join("config.toml").exists());
     }
 
     #[test]
