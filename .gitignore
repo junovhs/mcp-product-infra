@@ -11,5 +11,6 @@ Cargo.lock
 SEMMAP.md
 .semmap/
 
-# semclear check output (regenerable dossier artifact)
+# semclear check output (regenerable — the dossier artifact and its cache)
 semclear-dossier.json
+.semclear/
