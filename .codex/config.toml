@@ -5,8 +5,7 @@ url = "http://127.0.0.1:7977/mcp?root=/home/juno/mcp-product-infra"
 approval_mode = "approve"
 
 [mcp_servers.semmap]
-command = "semmap"
-args = ["mcp"]
+url = "http://127.0.0.1:7978/mcp?root=/home/juno/mcp-product-infra"
 
 [mcp_servers.semmap.tools.semmap_generate]
 approval_mode = "approve"
