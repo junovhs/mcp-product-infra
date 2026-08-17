@@ -81,17 +81,16 @@ pub fn run_with_timeout(spec: &HandlerCommand, timeout: Duration) -> io::Result<
     }
 
     child.start_kill()?;
-    let drain_deadline = Instant::now() + POST_KILL_DRAIN;
-    let tree_terminated = loop {
-        if child.try_wait()?.is_some() {
-            break true;
-        }
-        let now = Instant::now();
-        if now >= drain_deadline {
-            break false;
-        }
-        thread::sleep(WAIT_POLL.min(drain_deadline.saturating_duration_since(now)));
+    let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = wait_tx.send(child.wait());
+    });
+    let tree_terminated = match wait_rx.recv_timeout(POST_KILL_DRAIN) {
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) => return Err(error),
+        Err(_) => false,
     };
+    let drain_deadline = Instant::now() + POST_KILL_DRAIN;
 
     Ok(ProcessOutcome::TimedOut {
         pid,
@@ -194,7 +193,7 @@ mod tests {
 
     fn assert_tree_timeout(spec: HandlerCommand) {
         let started = Instant::now();
-        let outcome = run_with_timeout(&spec, Duration::from_millis(100)).unwrap();
+        let outcome = run_with_timeout(&spec, Duration::from_secs(1)).unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));
         let ProcessOutcome::TimedOut {
             pid,
