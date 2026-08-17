@@ -145,6 +145,213 @@ impl Service {
         )
     }
 
+    /// The Scheduled Task name, which is what a user types into
+    /// `schtasks /Query /TN`. Derived from the product name alone — like the unit
+    /// name — so two products can never overwrite each other's supervisor.
+    pub fn task_name(&self) -> String {
+        format!("{}-serve", self.hub.name())
+    }
+
+    /// The task as Task Scheduler addresses it: a name in the root folder.
+    pub fn task_path(&self) -> PathBuf {
+        PathBuf::from(format!("\\{}", self.task_name()))
+    }
+
+    /// What the task actually launches.
+    ///
+    /// A Scheduled Task has no equivalent of systemd's `Environment=`: the XML
+    /// schema simply cannot carry environment variables. A product that gates its
+    /// own `serve` behind one (semmap does) would therefore install a task that
+    /// its own gate rejects at every start — the precise failure the systemd
+    /// `Environment=` support was added to fix. So when variables are declared the
+    /// action is wrapped in `cmd.exe /c set ... && <exe>`, and when none are
+    /// declared the executable is invoked directly, leaving the common case free
+    /// of a wrapper process.
+    fn windows_action(&self, exe: &str, port: u16) -> (String, String) {
+        if self.env.is_empty() {
+            return (exe.to_string(), format!("serve --port {port}"));
+        }
+        let assignments: String = self
+            .env
+            .iter()
+            .map(|(key, value)| format!("set \"{key}={value}\" && "))
+            .collect();
+        (
+            "cmd.exe".to_string(),
+            format!("/c {assignments}\"{exe}\" serve --port {port}"),
+        )
+    }
+
+    /// Render the Scheduled Task registration. Pure, so the XML can be asserted on
+    /// without touching Task Scheduler.
+    ///
+    /// Two triggers, because they do different jobs. The `LogonTrigger` starts the
+    /// hub at login, which is what makes it survive a reboot. The repeating
+    /// `TimeTrigger` is the `Restart=always` equivalent.
+    ///
+    /// It is emphatically NOT `RestartOnFailure`, which is the intuitive choice and
+    /// the wrong one: that setting governs the task failing to *start*, not the
+    /// launched program exiting. Killing the supervised hub with it configured left
+    /// the task sitting at `Ready` with `Last Result: -1` and nothing ever came
+    /// back. A trigger repeating every minute retries instead, and
+    /// `MultipleInstancesPolicy=IgnoreNew` makes each retry a no-op while the hub
+    /// is healthy — so the pair behaves as "start it, and start it again whenever
+    /// it is not running". `RestartOnFailure` is kept for the case it does cover,
+    /// bounded at 5 like `StartLimitBurst`.
+    ///
+    /// The repetition must hang off a `TimeTrigger` with a `StartBoundary` in the
+    /// past. A `<Repetition>` nested in the `LogonTrigger` is accepted by
+    /// `schtasks /Create` and then silently discarded — `schtasks /Query /V` shows
+    /// `Repeat: Every: N/A` — which is a supervisor that reports success and
+    /// supervises nothing.
+    ///
+    /// `ExecutionTimeLimit` of `PT0S` means "no limit", without which Task
+    /// Scheduler stops a long-lived server after three days.
+    ///
+    /// `user_id` scopes both the trigger and the principal to one account, and it
+    /// is not optional: a `LogonTrigger` carrying no `UserId` fires for *every*
+    /// user of the machine, and registering that is an administrative act. Without
+    /// it `schtasks /Create` fails with a bare "Access is denied" on a normal
+    /// account — which would make this backend useless for exactly the per-user,
+    /// admin-free install it exists to provide.
+    pub fn task_xml(&self, exe: &str, port: u16, working_dir: &str, user_id: &str) -> String {
+        let (command, arguments) = self.windows_action(exe, port);
+        let command = xml_text(&command);
+        let arguments = xml_text(&arguments);
+        let working_dir = xml_text(working_dir);
+        let description = xml_text(self.description);
+        let user_id = xml_text(user_id);
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
+             <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
+             \x20 <RegistrationInfo>\n\
+             \x20   <Description>{description}</Description>\n\
+             \x20 </RegistrationInfo>\n\
+             \x20 <Triggers>\n\
+             \x20   <LogonTrigger>\n\
+             \x20     <Enabled>true</Enabled>\n\
+             \x20     <UserId>{user_id}</UserId>\n\
+             \x20   </LogonTrigger>\n\
+             \x20   <TimeTrigger>\n\
+             \x20     <StartBoundary>2000-01-01T00:00:00</StartBoundary>\n\
+             \x20     <Repetition>\n\
+             \x20       <Interval>PT1M</Interval>\n\
+             \x20     </Repetition>\n\
+             \x20   </TimeTrigger>\n\
+             \x20 </Triggers>\n\
+             \x20 <Principals>\n\
+             \x20   <Principal id=\"Author\">\n\
+             \x20     <UserId>{user_id}</UserId>\n\
+             \x20     <LogonType>InteractiveToken</LogonType>\n\
+             \x20     <RunLevel>LeastPrivilege</RunLevel>\n\
+             \x20   </Principal>\n\
+             \x20 </Principals>\n\
+             \x20 <Settings>\n\
+             \x20   <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n\
+             \x20   <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n\
+             \x20   <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n\
+             \x20   <AllowHardTerminate>true</AllowHardTerminate>\n\
+             \x20   <StartWhenAvailable>true</StartWhenAvailable>\n\
+             \x20   <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n\
+             \x20   <IdleSettings>\n\
+             \x20     <StopOnIdleEnd>false</StopOnIdleEnd>\n\
+             \x20     <RestartOnIdle>false</RestartOnIdle>\n\
+             \x20   </IdleSettings>\n\
+             \x20   <AllowStartOnDemand>true</AllowStartOnDemand>\n\
+             \x20   <Enabled>true</Enabled>\n\
+             \x20   <Hidden>true</Hidden>\n\
+             \x20   <RunOnlyIfIdle>false</RunOnlyIfIdle>\n\
+             \x20   <WakeToRun>false</WakeToRun>\n\
+             \x20   <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n\
+             \x20   <Priority>7</Priority>\n\
+             \x20   <RestartOnFailure>\n\
+             \x20     <Interval>PT1M</Interval>\n\
+             \x20     <Count>5</Count>\n\
+             \x20   </RestartOnFailure>\n\
+             \x20 </Settings>\n\
+             \x20 <Actions Context=\"Author\">\n\
+             \x20   <Exec>\n\
+             \x20     <Command>{command}</Command>\n\
+             \x20     <Arguments>{arguments}</Arguments>\n\
+             \x20     <WorkingDirectory>{working_dir}</WorkingDirectory>\n\
+             \x20   </Exec>\n\
+             \x20 </Actions>\n\
+             </Task>\n"
+        )
+    }
+
+    /// The launchd job label, which is what a user passes to `launchctl`.
+    pub fn plist_label(&self) -> String {
+        format!("com.{}.serve", self.hub.name())
+    }
+
+    /// Where the per-user LaunchAgent lives. `~/Library/LaunchAgents` is the
+    /// per-user location; `/Library/LaunchDaemons` would be machine-wide and needs
+    /// root, which a per-user product install must not require.
+    pub fn plist_path(&self) -> Result<PathBuf, String> {
+        let dirs = directories::BaseDirs::new().ok_or("cannot resolve a home directory")?;
+        Ok(dirs
+            .home_dir()
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{}.plist", self.plist_label())))
+    }
+
+    /// Render the LaunchAgent. Pure, so it can be asserted on from any platform —
+    /// which is the only way this is covered at all, since macOS cannot be
+    /// executed on the machine this was written on.
+    ///
+    /// `KeepAlive` is the `Restart=always` equivalent; `ThrottleInterval` is the
+    /// rate bound, and launchd's floor is 10 seconds regardless of a lower value.
+    pub fn plist_contents(&self, exe: &str, port: u16, working_dir: &str) -> String {
+        let label = xml_text(&self.plist_label());
+        let environment = if self.env.is_empty() {
+            String::new()
+        } else {
+            let entries: String = self
+                .env
+                .iter()
+                .map(|(key, value)| {
+                    format!(
+                        "\x20   <key>{}</key>\n\x20   <string>{}</string>\n",
+                        xml_text(key),
+                        xml_text(value)
+                    )
+                })
+                .collect();
+            format!("\x20 <key>EnvironmentVariables</key>\n\x20 <dict>\n{entries}\x20 </dict>\n")
+        };
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+             \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\">\n\
+             <dict>\n\
+             \x20 <key>Label</key>\n\
+             \x20 <string>{label}</string>\n\
+             \x20 <key>ProgramArguments</key>\n\
+             \x20 <array>\n\
+             \x20   <string>{exe}</string>\n\
+             \x20   <string>serve</string>\n\
+             \x20   <string>--port</string>\n\
+             \x20   <string>{port}</string>\n\
+             \x20 </array>\n\
+             \x20 <key>WorkingDirectory</key>\n\
+             \x20 <string>{working_dir}</string>\n\
+             {environment}\
+             \x20 <key>RunAtLoad</key>\n\
+             \x20 <true/>\n\
+             \x20 <key>KeepAlive</key>\n\
+             \x20 <true/>\n\
+             \x20 <key>ThrottleInterval</key>\n\
+             \x20 <integer>2</integer>\n\
+             </dict>\n\
+             </plist>\n",
+            exe = xml_text(exe),
+            working_dir = xml_text(working_dir)
+        )
+    }
+
     /// Is a systemd user session actually available? Having the binary on PATH is
     /// not enough — in a container or over a bare ssh session there may be no user
     /// manager to talk to, and installing into one that cannot run is a false
@@ -169,7 +376,12 @@ impl Service {
     /// run out of a build directory or a temp dir would leave an enabled unit
     /// pointing at a path that disappears, which fails silently at the next boot.
     fn durability_warning(&self, exe: &Path) -> Option<String> {
-        let text = exe.display().to_string();
+        // Normalize separators before matching: the markers below are written with
+        // forward slashes, so on Windows — where a build path is
+        // `...\target\debug\...` — none of them would ever fire, and the warning
+        // would be silently dead on the one platform whose install this was added
+        // alongside.
+        let text = exe.display().to_string().replace('\\', "/");
         let name = self.hub.name();
         // The worktree marker is built from the product's own dot-directory
         // rather than a bare `/worktrees/`: a bare match would warn about any
@@ -190,17 +402,209 @@ impl Service {
             })
     }
 
-    /// Materialize the unit, reload systemd, and enable + start it now.
+    /// Install and start the supervisor that keeps this product's hub resident.
+    ///
+    /// Dispatches to the platform's own per-user supervisor. Every backend is
+    /// compiled on every platform — the choice is a runtime `cfg!`, not a
+    /// `#[cfg]` — so a change to the macOS renderer still type-checks and is still
+    /// unit-tested on a Windows or Linux machine. Only the OS commands differ.
     pub fn install(&self, port: u16) -> Result<ServiceOutcome, String> {
-        if let Some(reason) = self.systemd_user_available() {
-            return Ok(ServiceOutcome::Unsupported(reason));
-        }
         let name = self.hub.name();
         let exe = std::env::current_exe()
             .map_err(|error| format!("cannot resolve the running {name} binary: {error}"))?;
         let working_dir = directories::BaseDirs::new()
             .map(|dirs| dirs.home_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("/"));
+        if cfg!(target_os = "linux") {
+            self.install_systemd(port, &exe, &working_dir)
+        } else if cfg!(target_os = "windows") {
+            self.install_windows(port, &exe, &working_dir)
+        } else if cfg!(target_os = "macos") {
+            self.install_launchd(port, &exe, &working_dir)
+        } else {
+            Ok(ServiceOutcome::Unsupported(format!(
+                "no per-user supervisor is implemented for this platform, so {name} \
+                 will not survive a reboot; start it with `{name} serve`"
+            )))
+        }
+    }
+
+    /// Stop, disable, and remove the supervisor this product installed.
+    pub fn uninstall(&self) -> Result<ServiceOutcome, String> {
+        if cfg!(target_os = "linux") {
+            self.uninstall_systemd()
+        } else if cfg!(target_os = "windows") {
+            self.uninstall_windows()
+        } else if cfg!(target_os = "macos") {
+            self.uninstall_launchd()
+        } else {
+            Ok(ServiceOutcome::Unsupported(
+                "no per-user supervisor is implemented for this platform".to_string(),
+            ))
+        }
+    }
+
+    /// Register the Scheduled Task from XML and start it now.
+    ///
+    /// The XML is written UTF-16LE with a BOM: `schtasks /Create /XML` rejects a
+    /// UTF-8 file whose declaration says UTF-16, and reads the encoding from the
+    /// bytes rather than the declaration.
+    fn install_windows(
+        &self,
+        port: u16,
+        exe: &Path,
+        working_dir: &Path,
+    ) -> Result<ServiceOutcome, String> {
+        let task = self.task_name();
+        let xml = self.task_xml(
+            &exe.display().to_string(),
+            port,
+            &working_dir.display().to_string(),
+            &windows_user_id(),
+        );
+        let xml_file = std::env::temp_dir().join(format!("{task}.xml"));
+        std::fs::write(&xml_file, utf16le_with_bom(&xml))
+            .map_err(|error| format!("write {}: {error}", xml_file.display()))?;
+
+        // /F replaces an existing registration, which is what makes re-running the
+        // install an upgrade rather than an error.
+        let created = schtasks(&[
+            "/Create",
+            "/TN",
+            &task,
+            "/XML",
+            &xml_file.display().to_string(),
+            "/F",
+        ])?;
+        let _ = std::fs::remove_file(&xml_file);
+        if !created.status.success() {
+            return Err(format!(
+                "schtasks /Create /TN {task} failed: {}",
+                command_message(&created)
+            ));
+        }
+        let run = schtasks(&["/Run", "/TN", &task])?;
+        if !run.status.success() {
+            return Err(format!(
+                "the task registered but schtasks /Run /TN {task} failed, so the hub is \
+                 not up yet: {}",
+                command_message(&run)
+            ));
+        }
+        let status = schtasks_status(&task);
+        Ok(ServiceOutcome::Installed {
+            unit_path: self.task_path(),
+            enabled: status.clone(),
+            active: status,
+            warning: self.durability_warning(exe),
+        })
+    }
+
+    fn uninstall_windows(&self) -> Result<ServiceOutcome, String> {
+        let task = self.task_name();
+        // Ending a task that is not running also "fails", so its result is only
+        // advisory; deletion is the step that has to succeed.
+        let _ = schtasks(&["/End", "/TN", &task]);
+        let deleted = schtasks(&["/Delete", "/TN", &task, "/F"])?;
+        let missing = command_message(&deleted).contains("cannot find");
+        if !deleted.status.success() && !missing {
+            return Err(format!(
+                "schtasks /Delete /TN {task} failed, so the supervisor may still be \
+                 registered: {}",
+                command_message(&deleted)
+            ));
+        }
+        Ok(ServiceOutcome::Uninstalled {
+            unit_path: self.task_path(),
+            removed: deleted.status.success(),
+        })
+    }
+
+    /// Write the LaunchAgent and load it now.
+    fn install_launchd(
+        &self,
+        port: u16,
+        exe: &Path,
+        working_dir: &Path,
+    ) -> Result<ServiceOutcome, String> {
+        let path = self.plist_path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {error}", parent.display()))?;
+        }
+        std::fs::write(
+            &path,
+            self.plist_contents(
+                &exe.display().to_string(),
+                port,
+                &working_dir.display().to_string(),
+            ),
+        )
+        .map_err(|error| format!("write {}: {error}", path.display()))?;
+
+        let target = format!("gui/{}", current_uid());
+        // Replacing an existing job requires removing it first; bootout failing
+        // because nothing was loaded is the normal first-install case.
+        let _ = launchctl(&["bootout", &target, &path.display().to_string()]);
+        let loaded = launchctl(&["bootstrap", &target, &path.display().to_string()])?;
+        if !loaded.status.success() {
+            return Err(format!(
+                "launchctl bootstrap {target} {} failed: {}",
+                path.display(),
+                command_message(&loaded)
+            ));
+        }
+        let label = self.plist_label();
+        let _ = launchctl(&["enable", &format!("{target}/{label}")]);
+        let status = match launchctl(&["print", &format!("{target}/{label}")]) {
+            Ok(output) if output.status.success() => "loaded".to_string(),
+            Ok(output) => command_message(&output),
+            Err(error) => error,
+        };
+        Ok(ServiceOutcome::Installed {
+            unit_path: path,
+            enabled: status.clone(),
+            active: status,
+            warning: self.durability_warning(exe),
+        })
+    }
+
+    fn uninstall_launchd(&self) -> Result<ServiceOutcome, String> {
+        let path = self.plist_path()?;
+        let target = format!("gui/{}", current_uid());
+        let booted_out = launchctl(&["bootout", &target, &path.display().to_string()]);
+        if let Ok(output) = &booted_out {
+            if !output.status.success() && path.exists() {
+                let message = command_message(output);
+                // "No such process" is the already-unloaded case, not a failure.
+                if !message.contains("No such process") && !message.contains("not find") {
+                    return Err(format!(
+                        "launchctl bootout failed, so the agent may still be running: {message}"
+                    ));
+                }
+            }
+        }
+        let removed = match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(format!("remove {}: {error}", path.display())),
+        };
+        Ok(ServiceOutcome::Uninstalled {
+            unit_path: path,
+            removed,
+        })
+    }
+
+    /// Materialize the unit, reload systemd, and enable + start it now.
+    fn install_systemd(
+        &self,
+        port: u16,
+        exe: &Path,
+        working_dir: &Path,
+    ) -> Result<ServiceOutcome, String> {
+        if let Some(reason) = self.systemd_user_available() {
+            return Ok(ServiceOutcome::Unsupported(reason));
+        }
         let path = self.unit_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -235,12 +639,12 @@ impl Service {
             unit_path: path,
             enabled: query(&["--user", "is-enabled", &unit_name]),
             active: query(&["--user", "is-active", &unit_name]),
-            warning: self.durability_warning(&exe),
+            warning: self.durability_warning(exe),
         })
     }
 
     /// Stop, disable, and remove the unit.
-    pub fn uninstall(&self) -> Result<ServiceOutcome, String> {
+    fn uninstall_systemd(&self) -> Result<ServiceOutcome, String> {
         if let Some(reason) = self.systemd_user_available() {
             return Ok(ServiceOutcome::Unsupported(reason));
         }
@@ -294,6 +698,99 @@ fn systemd_value(raw: &str) -> String {
         format!("\"{}\"", escaped.replace('\\', "\\\\").replace('"', "\\\""))
     } else {
         escaped
+    }
+}
+
+/// Escape a value for XML text content.
+///
+/// Both the Scheduled Task registration and the LaunchAgent are XML, and both
+/// carry filesystem paths chosen by whoever installed the product. A path
+/// containing `&` or `<` — legal on Windows and macOS alike — would otherwise
+/// produce a document the OS rejects, or worse, one it misreads.
+fn xml_text(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Encode as UTF-16LE with a byte-order mark.
+///
+/// `schtasks /Create /XML` determines the encoding from the file's bytes, not
+/// from the XML declaration, and rejects a file whose declaration says UTF-16
+/// while the bytes are UTF-8 with "The task XML is malformed".
+fn utf16le_with_bom(text: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
+/// The current user's numeric id, for launchctl's `gui/<uid>` domain target.
+fn current_uid() -> String {
+    // Only ever called on macOS, where `id -u` is always present.
+    match Command::new("id").arg("-u").output() {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        Err(_) => String::new(),
+    }
+}
+
+/// The account the task is registered for, as `DOMAIN\user`.
+///
+/// Read from the environment rather than shelled out for: `whoami` renders an
+/// Entra/AzureAD account as `AzureAD+user`, which Task Scheduler does not accept,
+/// while `USERDOMAIN`/`USERNAME` give the `AzureAD\user` form it does. Falls back
+/// to the bare user name when no domain is set, which is the local-account case.
+fn windows_user_id() -> String {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    match std::env::var("USERDOMAIN") {
+        Ok(domain) if !domain.is_empty() && !user.is_empty() => format!("{domain}\\{user}"),
+        _ => user,
+    }
+}
+
+fn schtasks(args: &[&str]) -> Result<std::process::Output, String> {
+    Command::new("schtasks")
+        .args(args)
+        .output()
+        .map_err(|error| format!("schtasks {}: {error}", args.join(" ")))
+}
+
+fn launchctl(args: &[&str]) -> Result<std::process::Output, String> {
+    Command::new("launchctl")
+        .args(args)
+        .output()
+        .map_err(|error| format!("launchctl {}: {error}", args.join(" ")))
+}
+
+/// What a command actually said, preferring stderr and falling back to stdout —
+/// schtasks reports several failures on stdout.
+fn command_message(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    } else {
+        stderr
+    }
+}
+
+/// The task's state as Task Scheduler reports it, so the caller states a fact
+/// rather than assuming the registration took.
+fn schtasks_status(task: &str) -> String {
+    match schtasks(&["/Query", "/TN", task, "/FO", "LIST"]) {
+        Ok(output) => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find(|line| line.trim_start().starts_with("Status:"))
+            .map(|line| {
+                line.split_once(':')
+                    .map_or("", |(_, v)| v)
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_else(|| command_message(&output)),
+        Err(error) => error,
     }
 }
 
@@ -474,5 +971,233 @@ mod tests {
         assert!(SERVICE
             .unit_contents("/usr/bin/testprod", 7977, "/home/x")
             .contains("Description=Testprod MCP hub (loopback HTTP)"));
+    }
+
+    // ---- Windows Scheduled Task -------------------------------------------
+
+    #[test]
+    fn the_task_starts_the_running_binary_on_the_requested_port() {
+        let xml = SERVICE.task_xml(
+            "C:\\bin\\testprod.exe",
+            7977,
+            "C:\\Users\\someone",
+            "DOM\\me",
+        );
+        assert!(
+            xml.contains("<Command>C:\\bin\\testprod.exe</Command>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<Arguments>serve --port 7977</Arguments>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<WorkingDirectory>C:\\Users\\someone</WorkingDirectory>"),
+            "{xml}"
+        );
+        // The restart guarantee is the entire reason this registration exists, and
+        // on Windows it is the repeating trigger that provides it: RestartOnFailure
+        // does NOT restart a task whose launched program exited, which was proven
+        // by killing the supervised hub and watching the task go back to Ready.
+        assert!(xml.contains("<Repetition>"), "{xml}");
+        assert!(xml.contains("<Interval>PT1M</Interval>"), "{xml}");
+        // The repetition must hang off the TimeTrigger: nested in the LogonTrigger
+        // it is accepted and then silently discarded, leaving no keep-alive at all.
+        let time_trigger =
+            &xml[xml.find("<TimeTrigger>").unwrap()..xml.find("</TimeTrigger>").unwrap()];
+        assert!(time_trigger.contains("<Repetition>"), "{time_trigger}");
+        assert!(time_trigger.contains("<StartBoundary>"), "{time_trigger}");
+        let logon_trigger =
+            &xml[xml.find("<LogonTrigger>").unwrap()..xml.find("</LogonTrigger>").unwrap()];
+        assert!(!logon_trigger.contains("<Repetition>"), "{logon_trigger}");
+        // Each retry must be a no-op while the hub is healthy, or the repetition
+        // would pile up a new server every minute.
+        assert!(
+            xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<RestartOnFailure>"), "{xml}");
+        // ...bounded, exactly as StartLimitBurst bounds the systemd unit.
+        assert!(xml.contains("<Count>5</Count>"), "{xml}");
+        // Without this Task Scheduler stops a long-lived server after three days.
+        assert!(
+            xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"),
+            "{xml}"
+        );
+        // It has to come back after a reboot, which is the whole point.
+        assert!(xml.contains("<LogonTrigger>"), "{xml}");
+    }
+
+    /// A Scheduled Task cannot carry environment variables, so a product that
+    /// gates its own `serve` behind one (semmap does) must still get them — or the
+    /// installed task is rejected by that product's gate at every start.
+    #[test]
+    fn declared_environment_reaches_the_task_through_a_command_wrapper() {
+        let service = SERVICE.with_env(&[("PROD_CLI", "1"), ("PROD_MODE", "hub")]);
+        let xml = service.task_xml("C:\\bin\\testprod.exe", 7977, "C:\\Users\\x", "DOM\\me");
+        assert!(xml.contains("<Command>cmd.exe</Command>"), "{xml}");
+        let args = &xml[xml.find("<Arguments>").unwrap()..xml.find("</Arguments>").unwrap()];
+        assert!(args.contains("set &quot;PROD_CLI=1&quot;"), "{args}");
+        assert!(args.contains("set &quot;PROD_MODE=hub&quot;"), "{args}");
+        assert!(
+            args.find("PROD_CLI").unwrap() < args.find("PROD_MODE").unwrap(),
+            "declaration order must be preserved: {args}"
+        );
+        assert!(
+            args.contains("&amp;&amp;"),
+            "the shell operator must be XML-escaped or the document is malformed: {args}"
+        );
+        assert!(
+            args.contains("testprod.exe&quot; serve --port 7977"),
+            "{args}"
+        );
+    }
+
+    /// A product declaring nothing must get no wrapper process at all.
+    #[test]
+    fn a_task_with_no_environment_invokes_the_binary_directly() {
+        let xml = SERVICE.task_xml("C:\\bin\\testprod.exe", 7977, "C:\\Users\\x", "DOM\\me");
+        assert!(!xml.contains("cmd.exe"), "{xml}");
+    }
+
+    /// A path containing XML metacharacters is legal on Windows and must not be
+    /// able to produce a document Task Scheduler rejects or misreads.
+    #[test]
+    fn awkward_paths_cannot_break_the_task_xml() {
+        let xml = SERVICE.task_xml("C:\\a&b\\<prod>.exe", 7977, "C:\\Users\\o'brien", "DOM\\me");
+        assert!(xml.contains("C:\\a&amp;b\\&lt;prod&gt;.exe"), "{xml}");
+        assert!(xml.contains("o&apos;brien"), "{xml}");
+        assert!(
+            !xml.contains("<prod>"),
+            "raw angle brackets must not survive: {xml}"
+        );
+    }
+
+    /// A `LogonTrigger` with no `UserId` fires for every account on the machine,
+    /// which Windows treats as an administrative registration and refuses with a
+    /// bare "Access is denied" on a normal user. Both the trigger and the
+    /// principal must name the account, or this backend cannot install at all
+    /// without elevation — which was confirmed against `schtasks /Create` on a
+    /// non-elevated account before this was written.
+    #[test]
+    fn the_task_is_scoped_to_one_account_so_it_installs_without_elevation() {
+        let xml = SERVICE.task_xml(
+            "C:\\bin\\testprod.exe",
+            7977,
+            "C:\\Users\\x",
+            "AzureAD\\dev",
+        );
+        let triggers = &xml[xml.find("<Triggers>").unwrap()..xml.find("</Triggers>").unwrap()];
+        assert!(
+            triggers.contains("<UserId>AzureAD\\dev</UserId>"),
+            "the trigger must name the account: {triggers}"
+        );
+        let principals =
+            &xml[xml.find("<Principals>").unwrap()..xml.find("</Principals>").unwrap()];
+        assert!(
+            principals.contains("<UserId>AzureAD\\dev</UserId>"),
+            "the principal must name the account: {principals}"
+        );
+        // LeastPrivilege: a loopback listener has no business running elevated.
+        assert!(
+            principals.contains("<RunLevel>LeastPrivilege</RunLevel>"),
+            "{principals}"
+        );
+    }
+
+    #[test]
+    fn each_product_gets_its_own_task_name() {
+        let other = Service::new(Hub::new("otherprod", 7988), "Otherprod MCP hub");
+        assert_eq!(SERVICE.task_name(), "testprod-serve");
+        assert_eq!(other.task_name(), "otherprod-serve");
+        assert_ne!(SERVICE.task_path(), other.task_path());
+    }
+
+    #[test]
+    fn the_task_xml_is_utf16_with_a_bom_because_schtasks_reads_the_bytes() {
+        let bytes = utf16le_with_bom("<Task/>");
+        assert_eq!(&bytes[..2], &[0xFF, 0xFE], "byte-order mark first");
+        assert_eq!(&bytes[2..4], &[b'<', 0x00], "little-endian UTF-16");
+    }
+
+    // ---- macOS LaunchAgent -------------------------------------------------
+
+    #[test]
+    fn the_agent_starts_the_running_binary_on_the_requested_port() {
+        let plist = SERVICE.plist_contents("/usr/local/bin/testprod", 7977, "/Users/someone");
+        assert!(
+            plist.contains("<string>/usr/local/bin/testprod</string>"),
+            "{plist}"
+        );
+        assert!(plist.contains("<string>--port</string>"), "{plist}");
+        assert!(plist.contains("<string>7977</string>"), "{plist}");
+        assert!(plist.contains("<string>/Users/someone</string>"), "{plist}");
+        // KeepAlive is launchd's Restart=always; RunAtLoad is what survives reboot.
+        assert!(plist.contains("<key>KeepAlive</key>"), "{plist}");
+        assert!(plist.contains("<key>RunAtLoad</key>"), "{plist}");
+        assert!(plist.contains("<key>ThrottleInterval</key>"), "{plist}");
+    }
+
+    #[test]
+    fn declared_environment_reaches_the_agent_in_order() {
+        let service = SERVICE.with_env(&[("PROD_CLI", "1"), ("PROD_MODE", "hub")]);
+        let plist = service.plist_contents("/usr/local/bin/testprod", 7977, "/Users/x");
+        assert!(plist.contains("<key>EnvironmentVariables</key>"), "{plist}");
+        assert!(plist.contains("<key>PROD_CLI</key>"), "{plist}");
+        assert!(plist.contains("<string>hub</string>"), "{plist}");
+        assert!(
+            plist.find("PROD_CLI").unwrap() < plist.find("PROD_MODE").unwrap(),
+            "{plist}"
+        );
+    }
+
+    #[test]
+    fn an_agent_with_no_environment_omits_the_dictionary_entirely() {
+        let plist = SERVICE.plist_contents("/usr/local/bin/testprod", 7977, "/Users/x");
+        assert!(!plist.contains("EnvironmentVariables"), "{plist}");
+    }
+
+    #[test]
+    fn awkward_paths_cannot_break_the_plist() {
+        let plist = SERVICE.plist_contents("/opt/a&b/<prod>", 7977, "/Users/x");
+        assert!(plist.contains("/opt/a&amp;b/&lt;prod&gt;"), "{plist}");
+    }
+
+    #[test]
+    fn each_product_gets_its_own_agent_label() {
+        let other = Service::new(Hub::new("otherprod", 7988), "Otherprod MCP hub");
+        assert_eq!(SERVICE.plist_label(), "com.testprod.serve");
+        assert_eq!(other.plist_label(), "com.otherprod.serve");
+    }
+
+    #[test]
+    fn the_agent_lands_in_the_per_user_launchagents_directory() {
+        let path = SERVICE
+            .plist_path()
+            .expect("a home directory in the test environment");
+        assert!(
+            path.ends_with("Library/LaunchAgents/com.testprod.serve.plist"),
+            "{path:?}"
+        );
+    }
+
+    /// The fragile-path markers are written with forward slashes, so without
+    /// normalization the durability warning would be dead on Windows — the one
+    /// platform whose backend was added alongside it.
+    #[test]
+    fn a_windows_build_directory_binary_is_flagged_as_not_durable() {
+        assert!(SERVICE
+            .durability_warning(Path::new(
+                "C:\\Users\\x\\prod\\target\\release\\testprod.exe"
+            ))
+            .is_some());
+        assert!(SERVICE
+            .durability_warning(Path::new(
+                "C:\\Users\\x\\prod\\.testprod\\worktrees\\SERV-06\\testprod.exe"
+            ))
+            .is_some());
+        assert!(SERVICE
+            .durability_warning(Path::new("C:\\Users\\x\\.cargo\\bin\\testprod.exe"))
+            .is_none());
     }
 }
