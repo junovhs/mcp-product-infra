@@ -21,8 +21,22 @@ use std::process::Command;
 pub enum ServiceOutcome {
     Installed {
         unit_path: PathBuf,
+        /// The supervisor's own words for its state, for the human reading the
+        /// output. Their vocabulary differs per platform — systemd says
+        /// `enabled`/`active`, Task Scheduler says `Running` — so they are for
+        /// display, never for branching. Branch on `healthy`.
         enabled: String,
         active: String,
+        /// Whether the supervisor is actually supervising, decided by the backend
+        /// that knows what its own status vocabulary means.
+        ///
+        /// This is a typed fact rather than a string for the caller to pattern
+        /// match because every caller that tried got it wrong the same way: both
+        /// products tested for systemd's `enabled`/`active` literals, so a
+        /// perfectly healthy Windows install reporting `Running` was read as a
+        /// failure and `serve --install-service` exited 1 telling the user to run
+        /// `systemctl` — on a machine with no systemd, while the hub was serving.
+        healthy: bool,
         /// Set when the unit points at a location that may not survive, e.g. a
         /// build directory. Reported rather than silently accepted.
         warning: Option<String>,
@@ -494,6 +508,7 @@ impl Service {
         let status = schtasks_status(&task);
         Ok(ServiceOutcome::Installed {
             unit_path: self.task_path(),
+            healthy: windows_status_is_healthy(&status),
             enabled: status.clone(),
             active: status,
             warning: self.durability_warning(exe),
@@ -556,13 +571,14 @@ impl Service {
         }
         let label = self.plist_label();
         let _ = launchctl(&["enable", &format!("{target}/{label}")]);
-        let status = match launchctl(&["print", &format!("{target}/{label}")]) {
-            Ok(output) if output.status.success() => "loaded".to_string(),
-            Ok(output) => command_message(&output),
-            Err(error) => error,
+        let (status, healthy) = match launchctl(&["print", &format!("{target}/{label}")]) {
+            Ok(output) if output.status.success() => ("loaded".to_string(), true),
+            Ok(output) => (command_message(&output), false),
+            Err(error) => (error, false),
         };
         Ok(ServiceOutcome::Installed {
             unit_path: path,
+            healthy,
             enabled: status.clone(),
             active: status,
             warning: self.durability_warning(exe),
@@ -635,10 +651,13 @@ impl Service {
                 String::from_utf8_lossy(&enable.stderr).trim()
             ));
         }
+        let enabled = query(&["--user", "is-enabled", &unit_name]);
+        let active = query(&["--user", "is-active", &unit_name]);
         Ok(ServiceOutcome::Installed {
             unit_path: path,
-            enabled: query(&["--user", "is-enabled", &unit_name]),
-            active: query(&["--user", "is-active", &unit_name]),
+            healthy: systemd_status_is_healthy(&enabled, &active),
+            enabled,
+            active,
             warning: self.durability_warning(exe),
         })
     }
@@ -774,6 +793,23 @@ fn command_message(output: &std::process::Output) -> String {
     } else {
         stderr
     }
+}
+
+/// systemd supervises only when the unit is both enabled (so it returns after a
+/// reboot) and active (so it is running now). `enabled-runtime` counts: it is
+/// enabled for this boot, which is a real, if temporary, supervision.
+fn systemd_status_is_healthy(enabled: &str, active: &str) -> bool {
+    matches!(enabled, "enabled" | "enabled-runtime") && active == "active"
+}
+
+/// Task Scheduler supervises when the task is actually `Running`.
+///
+/// `Ready` deliberately does not count. It means the task is registered and will
+/// fire at its next trigger, which is exactly the state a hub that failed to
+/// start leaves behind — reporting it as healthy would be the same false success
+/// this typed field exists to prevent.
+fn windows_status_is_healthy(status: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("Running")
 }
 
 /// The task's state as Task Scheduler reports it, so the caller states a fact
@@ -1179,6 +1215,31 @@ mod tests {
             path.ends_with("Library/LaunchAgents/com.testprod.serve.plist"),
             "{path:?}"
         );
+    }
+
+    /// Health is the backend's judgement, not the caller's string matching. Both
+    /// products previously tested for systemd's literals, so a healthy Windows
+    /// install reporting `Running` was read as a failure and exited 1.
+    #[test]
+    fn each_backend_decides_health_in_its_own_vocabulary() {
+        assert!(systemd_status_is_healthy("enabled", "active"));
+        assert!(systemd_status_is_healthy("enabled-runtime", "active"));
+        assert!(!systemd_status_is_healthy("enabled", "inactive"));
+        assert!(!systemd_status_is_healthy("disabled", "active"));
+        assert!(!systemd_status_is_healthy("failed", "failed"));
+
+        assert!(windows_status_is_healthy("Running"));
+        assert!(windows_status_is_healthy("  running  "));
+        // `Ready` is registered-but-not-running — the exact state a hub that
+        // failed to start leaves behind, so it must not read as healthy.
+        assert!(!windows_status_is_healthy("Ready"));
+        assert!(!windows_status_is_healthy("Disabled"));
+        assert!(!windows_status_is_healthy(""));
+
+        // The systemd vocabulary must not be accepted by the Windows backend or
+        // vice versa; that cross-acceptance is what the old shared test did.
+        assert!(!windows_status_is_healthy("active"));
+        assert!(!systemd_status_is_healthy("Running", "Running"));
     }
 
     /// The fragile-path markers are written with forward slashes, so without
