@@ -27,7 +27,7 @@ pub use adapters::{
     AdapterAction, ClaudeHook, HostConfigFact, HostInstall, HostReadinessReport, HostServer,
     HostTransport, InstallReport,
 };
-pub use http::Hub;
+pub use http::{Concurrency, Hub};
 pub use manifest::{
     HandlerCommand, HandlerRequest, HandlerResponse, Manifest, ManifestDefect, ManifestMutation,
     ManifestTool,

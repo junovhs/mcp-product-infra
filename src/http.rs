@@ -36,6 +36,35 @@ const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// JSON-RPC parse-error code, returned for a body that is not JSON.
 const PARSE_ERROR: i32 = -32700;
 
+/// How long a peer may take to deliver its request or accept its response before
+/// the connection is abandoned. Generous next to a loopback round trip, which is
+/// sub-millisecond; this exists to bound a stalled or dead peer, not to police a
+/// slow one.
+const STALLED_PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How a hub overlaps connections.
+///
+/// This is a property of the product's handlers, not a performance dial, which
+/// is why it is an explicit choice with no default that silently fits everyone.
+/// A product whose handlers touch process-global state — capturing the stdout
+/// file descriptor, for instance — is only correct under [`Concurrency::Serial`];
+/// running it threaded interleaves two captures and corrupts both results with
+/// no error to show for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Concurrency {
+    /// Each connection is served on its own thread. Requires handlers that are
+    /// safe to run simultaneously.
+    Threaded,
+    /// Exactly one dispatch runs at a time, the same guarantee
+    /// `ServerConfig::serial()` gives the stdio loop.
+    ///
+    /// Connections are still accepted and read concurrently — it is the handler
+    /// that is serialized, not the socket. Serializing whole connections instead
+    /// would let one peer that connects and never finishes its request stall
+    /// every client behind it.
+    Serial,
+}
+
 /// One product's hub identity: everything about this transport that differs
 /// between products, and nothing else.
 ///
@@ -463,6 +492,15 @@ impl Hub {
     where
         F: Fn(&str) -> Option<String> + Clone + Send + 'static,
     {
+        self.serve_with(port, Concurrency::Threaded, dispatch)
+    }
+
+    /// [`Hub::serve`] with an explicit [`Concurrency`] policy, for a product
+    /// whose handlers are not safe to run simultaneously.
+    pub fn serve_with<F>(&self, port: u16, concurrency: Concurrency, dispatch: F) -> i32
+    where
+        F: Fn(&str) -> Option<String> + Clone + Send + 'static,
+    {
         let name = self.name;
         // Bind before touching the token. A second `serve` losing the port race
         // must fail without having written anything: the token is shared state a
@@ -497,7 +535,7 @@ impl Hub {
         println!("  host config: url = \"http://{bound}/mcp\"");
         println!("  bearer:      {token}");
 
-        if let Err(error) = self.run(listener, token, dispatch) {
+        if let Err(error) = self.run_with(listener, token, concurrency, dispatch) {
             eprintln!("{name} serve: {error}");
             return 1;
         }
@@ -521,6 +559,25 @@ impl Hub {
     where
         F: Fn(&str) -> Option<String> + Clone + Send + 'static,
     {
+        self.run_with(listener, token, Concurrency::Threaded, dispatch)
+    }
+
+    /// [`Hub::run`] with an explicit [`Concurrency`] policy.
+    ///
+    /// Under [`Concurrency::Serial`] a connection is served to completion on this
+    /// thread before the next is accepted, so a product whose handlers touch
+    /// process-global state stays correct. The loopback guard and the
+    /// accept-failure policy are identical under both policies.
+    pub fn run_with<F>(
+        &self,
+        listener: TcpListener,
+        token: String,
+        concurrency: Concurrency,
+        dispatch: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(&str) -> Option<String> + Clone + Send + 'static,
+    {
         match listener.local_addr() {
             Ok(addr) if addr.ip().is_loopback() => {}
             Ok(addr) => {
@@ -536,6 +593,9 @@ impl Hub {
                 ))
             }
         }
+        // Held across every connection under `Concurrency::Serial`, so exactly one
+        // dispatch runs at a time for the life of the hub.
+        let serial = std::sync::Arc::new(std::sync::Mutex::new(()));
         for stream in listener.incoming() {
             let mut stream = match stream {
                 Ok(stream) => stream,
@@ -544,11 +604,44 @@ impl Hub {
                     continue;
                 }
             };
-            let token = token.clone();
-            let dispatch = dispatch.clone();
-            std::thread::spawn(move || {
-                serve_connection(&mut stream, &token, |line| dispatch(line));
-            });
+            // A client that connects and then stalls must not hold the hub. Under
+            // `Serial` this is the difference between one slow peer and a dead
+            // service: the accept loop is the only thread there is, so a peer that
+            // opens a connection and never finishes its request would block every
+            // subsequent connection forever. Under `Threaded` it merely leaks one
+            // thread, but the deadline is right in both cases and is applied here,
+            // once, so no policy can be correct-by-accident.
+            let _ = stream.set_read_timeout(Some(STALLED_PEER_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(STALLED_PEER_TIMEOUT));
+            match concurrency {
+                Concurrency::Threaded => {
+                    let token = token.clone();
+                    let dispatch = dispatch.clone();
+                    std::thread::spawn(move || {
+                        serve_connection(&mut stream, &token, |line| dispatch(line));
+                    });
+                }
+                // Still a thread per connection, with a lock around `dispatch`
+                // alone. What a serial product needs is that no two *handlers*
+                // run at once, not that no two sockets are open at once — and
+                // serving inline would have conflated them, letting one peer that
+                // connects and never finishes its request block every later
+                // client for as long as the read deadline allows.
+                Concurrency::Serial => {
+                    let token = token.clone();
+                    let dispatch = dispatch.clone();
+                    let serial = std::sync::Arc::clone(&serial);
+                    std::thread::spawn(move || {
+                        serve_connection(&mut stream, &token, |line| {
+                            // Recover from a poisoned lock rather than propagating
+                            // it: one handler that panicked must not leave the hub
+                            // permanently unable to serve anyone.
+                            let _guard = serial.lock().unwrap_or_else(|e| e.into_inner());
+                            dispatch(line)
+                        });
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -915,6 +1008,169 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "token must not be world-readable");
         }
+    }
+
+    /// A dispatcher that records whether it was ever entered while already
+    /// running, and blocks long enough for an overlap to actually occur if the
+    /// policy permits one.
+    fn overlap_probe() -> (
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        impl Fn(&str) -> Option<String> + Clone + Send + 'static,
+    ) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let overlapped = Arc::new(AtomicBool::new(false));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&overlapped);
+        let dispatch = move |_line: &str| {
+            if in_flight.fetch_add(1, Ordering::SeqCst) > 0 {
+                seen.store(true, Ordering::SeqCst);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            Some(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string())
+        };
+        (overlapped, dispatch)
+    }
+
+    /// Fire `count` simultaneous authenticated requests at `addr` and wait for
+    /// them all to be answered.
+    ///
+    /// Every client carries a read deadline so that a regression which leaves a
+    /// connection unanswered fails this test instead of hanging the suite
+    /// forever with no indication of which property broke.
+    fn hammer(addr: SocketAddr, count: usize) {
+        use std::io::Write as _;
+        let clients: Vec<_> = (0..count)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                        .unwrap();
+                    let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#;
+                    write!(
+                        stream,
+                        "POST /mcp HTTP/1.1\r\nAuthorization: Bearer secret\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                    let mut reply = String::new();
+                    stream
+                        .read_to_string(&mut reply)
+                        .expect("the hub must answer every connection");
+                    assert!(reply.starts_with("HTTP/1.1 200 OK"), "got: {reply}");
+                })
+            })
+            .collect();
+        for client in clients {
+            client.join().unwrap();
+        }
+    }
+
+    /// The property a serial product depends on: two dispatches are never in
+    /// flight at once, no matter how many clients arrive together. Without this,
+    /// a product that captures the process-global stdout fd interleaves two
+    /// captures and corrupts both with no error to show for it.
+    #[test]
+    fn a_serial_hub_never_has_two_dispatches_in_flight() {
+        let (overlapped, dispatch) = overlap_probe();
+        let listener = HUB.bind(loopback(0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hub = HUB;
+        let server = std::thread::spawn(move || {
+            let listener = listener;
+            let _ = hub.run_with(
+                listener,
+                "secret".to_string(),
+                Concurrency::Serial,
+                dispatch,
+            );
+        });
+        hammer(addr, 4);
+        assert!(
+            !overlapped.load(std::sync::atomic::Ordering::SeqCst),
+            "a serial hub must never overlap dispatches"
+        );
+        drop(server);
+    }
+
+    /// A peer that connects and never finishes its request must not hold the hub.
+    /// Under `Serial` the accept loop is the only thread there is, so without a
+    /// deadline one stalled client is a dead service for every client after it.
+    #[test]
+    fn a_stalled_peer_cannot_wedge_a_serial_hub() {
+        use std::io::Write as _;
+        let listener = HUB.bind(loopback(0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hub = HUB;
+        std::thread::spawn(move || {
+            let _ = hub.run_with(listener, "secret".to_string(), Concurrency::Serial, echo);
+        });
+
+        // Announce a body, then never send it, and keep the socket open.
+        let mut stalled = std::net::TcpStream::connect(addr).unwrap();
+        stalled
+            .write_all(
+                b"POST /mcp HTTP/1.1\r\nAuthorization: Bearer secret\r\nContent-Length: 99\r\n\r\n",
+            )
+            .unwrap();
+
+        // The hub must still answer the next client. `hammer`'s own read deadline
+        // turns a wedged hub into a failure here rather than a hung suite.
+        hammer(addr, 1);
+        drop(stalled);
+    }
+
+    /// The default policy still overlaps, so a thread-safe product is not paying
+    /// for a guarantee it does not need.
+    ///
+    /// Asserted by rendezvous rather than by sleeping: each dispatch waits until
+    /// two are in flight together, so the test proves concurrency the moment it
+    /// actually happens instead of hoping a fixed sleep was long enough on a
+    /// loaded machine. The wait is bounded, so a genuinely serial hub fails here
+    /// rather than hanging.
+    #[test]
+    fn a_threaded_hub_does_overlap_dispatches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let probe_flight = Arc::clone(&in_flight);
+        let probe_gate = Arc::clone(&gate);
+        let dispatch = move |_line: &str| {
+            let (lock, cvar) = &*probe_gate;
+            if probe_flight.fetch_add(1, Ordering::SeqCst) + 1 >= 2 {
+                *lock.lock().unwrap() = true;
+                cvar.notify_all();
+            } else {
+                let reached = lock.lock().unwrap();
+                let _ = cvar
+                    .wait_timeout_while(reached, std::time::Duration::from_secs(10), |r| !*r)
+                    .unwrap();
+            }
+            probe_flight.fetch_sub(1, Ordering::SeqCst);
+            Some(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string())
+        };
+
+        let listener = HUB.bind(loopback(0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hub = HUB;
+        std::thread::spawn(move || {
+            let _ = hub.run_with(
+                listener,
+                "secret".to_string(),
+                Concurrency::Threaded,
+                dispatch,
+            );
+        });
+        hammer(addr, 2);
+        assert!(
+            *gate.0.lock().unwrap(),
+            "the threaded policy must let a second dispatch start while the first is still running"
+        );
     }
 
     /// The whole point of the transport, proven over a real socket: the server
