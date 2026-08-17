@@ -287,6 +287,12 @@ impl HostInstall {
             })?,
         ));
         files.push((
+            ".codex/.gitignore".to_string(),
+            with_action(&repo_root.join(".codex/.gitignore"), || {
+                ensure_codex_gitignore(&repo_root)
+            })?,
+        ));
+        files.push((
             ".claude/settings.local.json".to_string(),
             with_action(&repo_root.join(".claude/settings.local.json"), || {
                 self.ensure_claude_settings(&repo_root)
@@ -1751,15 +1757,23 @@ fn merge_claude_hooks(
     Ok(())
 }
 
-fn ensure_claude_gitignore(repo_root: &Path) -> Result<Materialized, String> {
-    let dir = repo_root.join(".claude");
+/// Append one managed line to a host directory's `.gitignore`, creating the file
+/// if it does not exist and leaving every other line — user rules included —
+/// exactly as found.
+///
+/// Adding the line at most once is what makes repeated `enable` runs a no-op; the
+/// membership test is on the trimmed line so a rule the user indented still
+/// counts as present rather than being duplicated on every run.
+fn ensure_managed_gitignore(dir: &Path, entry: &str) -> Result<Materialized, String> {
+    if let Some(skipped) = unusable_directory(dir) {
+        return Ok(skipped);
+    }
     let path = dir.join(".gitignore");
-    let entry = "scheduled_tasks.lock";
     let existing = fs::read_to_string(&path).unwrap_or_default();
     if existing.lines().any(|line| line.trim() == entry) {
         return Ok(Materialized::Wrote);
     }
-    fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+    fs::create_dir_all(dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
     let mut text = existing;
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
@@ -1768,6 +1782,22 @@ fn ensure_claude_gitignore(repo_root: &Path) -> Result<Materialized, String> {
     text.push('\n');
     fs::write(&path, text).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
     Ok(Materialized::Wrote)
+}
+
+fn ensure_claude_gitignore(repo_root: &Path) -> Result<Materialized, String> {
+    ensure_managed_gitignore(&repo_root.join(".claude"), "scheduled_tasks.lock")
+}
+
+/// The generated Codex config is machine-local and must not be committed.
+///
+/// Its `url` carries `?root=<absolute path>` (ADPT-14), which is a fact about one
+/// developer's filesystem. Committed, it hands every other clone a root that does
+/// not exist there — and because Codex merges a repo entry over the user entry,
+/// the broken registration wins and Codex is unusable in that repo. This is the
+/// `.claude/.gitignore` treatment applied to the file that actually carries a
+/// machine-local path.
+fn ensure_codex_gitignore(repo_root: &Path) -> Result<Materialized, String> {
+    ensure_managed_gitignore(&repo_root.join(".codex"), "config.toml")
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
@@ -1835,10 +1865,99 @@ mod tests {
             .managed_markdown_body("Use todo_* MCP tools.")
             .claude_allow("Bash(todo *)");
         let report = install.install_repo(dir.path()).unwrap();
-        assert_eq!(report.files.len(), 6);
+        assert_eq!(report.files.len(), 7);
         assert!(dir.path().join(".mcp.json").exists());
         assert!(dir.path().join(".codex/config.toml").exists());
+        assert!(dir.path().join(".codex/.gitignore").exists());
         assert!(dir.path().join("CLAUDE.md").exists());
+    }
+
+    /// ADPT-09 — the generated Codex config pins an absolute repository root, so
+    /// committing it ships one developer's filesystem layout to every clone. It
+    /// has to be ignored where it is generated.
+    #[test]
+    fn the_generated_codex_config_is_ignored_and_a_user_rule_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        fs::write(
+            dir.path().join(".codex/.gitignore"),
+            "# mine\nnotes.local.md\n",
+        )
+        .unwrap();
+
+        let install = HostInstall::new("todo").server(HostServer::http(
+            "todo",
+            "http://127.0.0.1:7977/mcp?root=/x",
+        ));
+        install.install_repo(dir.path()).unwrap();
+
+        let ignore = fs::read_to_string(dir.path().join(".codex/.gitignore")).unwrap();
+        assert!(
+            ignore.lines().any(|line| line.trim() == "config.toml"),
+            "the generated config must be ignored: {ignore}"
+        );
+        assert!(
+            ignore.contains("notes.local.md"),
+            "user rule kept: {ignore}"
+        );
+        assert!(ignore.contains("# mine"), "user comment kept: {ignore}");
+
+        // Idempotent: the managed line is added once, not once per run.
+        install.install_repo(dir.path()).unwrap();
+        let again = fs::read_to_string(dir.path().join(".codex/.gitignore")).unwrap();
+        assert_eq!(again, ignore, "a second run must change nothing");
+        assert_eq!(
+            again.lines().filter(|l| l.trim() == "config.toml").count(),
+            1,
+            "exactly one managed rule: {again}"
+        );
+    }
+
+    /// A `.gitignore` whose last line has no trailing newline must not have our
+    /// rule welded onto it.
+    #[test]
+    fn a_gitignore_without_a_trailing_newline_gains_its_own_line() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        fs::write(dir.path().join(".codex/.gitignore"), "notes.local.md").unwrap();
+
+        HostInstall::new("todo")
+            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"))
+            .install_repo(dir.path())
+            .unwrap();
+
+        let ignore = fs::read_to_string(dir.path().join(".codex/.gitignore")).unwrap();
+        assert!(
+            ignore.lines().any(|line| line.trim() == "notes.local.md"),
+            "{ignore}"
+        );
+        assert!(
+            ignore.lines().any(|line| line.trim() == "config.toml"),
+            "{ignore}"
+        );
+    }
+
+    /// A stray file where `.codex` should be a directory skips this one file
+    /// rather than failing the whole install.
+    #[test]
+    fn a_stray_file_at_dot_codex_skips_the_gitignore_too() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".codex"), "not a directory").unwrap();
+
+        let report = HostInstall::new("todo")
+            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"))
+            .install_repo(dir.path())
+            .unwrap();
+
+        let action = report
+            .files
+            .iter()
+            .find(|(name, _)| name == ".codex/.gitignore")
+            .map(|(_, action)| action.tag());
+        assert_eq!(action, Some("skipped"), "{:?}", report.files);
     }
 
     /// ADPT-04 — the exact live case: a repo `.codex/config.toml` carrying our
