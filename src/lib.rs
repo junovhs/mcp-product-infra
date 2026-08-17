@@ -10,6 +10,7 @@ pub mod activity;
 pub mod adapters;
 pub mod agent_guard;
 pub mod capture;
+pub mod http;
 pub mod manifest;
 pub mod process;
 pub mod registry;
@@ -25,6 +26,7 @@ pub use adapters::{
     AdapterAction, ClaudeHook, HostConfigFact, HostInstall, HostReadinessReport, HostServer,
     HostTransport, InstallReport,
 };
+pub use http::Hub;
 pub use manifest::{
     HandlerCommand, HandlerRequest, HandlerResponse, Manifest, ManifestDefect, ManifestMutation,
     ManifestTool,

@@ -10,6 +10,7 @@ keywords = ["mcp", "agents", "model-context-protocol", "sidecar"]
 categories = ["development-tools", "api-bindings"]
 
 [dependencies]
+directories = "6"
 getrandom = "0.3"
 process-wrap = { version = "9", default-features = false, features = ["std", "process-group", "job-object"] }
 serde = { version = "1", features = ["derive"] }
