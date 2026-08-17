@@ -41,13 +41,33 @@ pub enum ServiceOutcome {
 pub struct Service {
     hub: Hub,
     description: &'static str,
+    env: &'static [(&'static str, &'static str)],
 }
 
 impl Service {
     /// Declare a product's service. `description` becomes the unit's
     /// `Description=` line, which is what `systemctl --user status` shows.
     pub const fn new(hub: Hub, description: &'static str) -> Self {
-        Self { hub, description }
+        Self {
+            hub,
+            description,
+            env: &[],
+        }
+    }
+
+    /// Declare environment variables the unit sets for the served process, in
+    /// the order given.
+    ///
+    /// A `static` slice rather than an owned collection so a product can still
+    /// declare its whole service as a `const`, and so what the unit will set is
+    /// visible in code instead of inherited from whatever shell ran the install.
+    /// This exists because a product may gate its own `serve` command behind an
+    /// environment variable: the systemd user manager inherits nothing from the
+    /// operator's shell, so without this the installed unit is rejected by the
+    /// product's own gate at every start.
+    pub const fn with_env(mut self, env: &'static [(&'static str, &'static str)]) -> Self {
+        self.env = env;
+        self
     }
 
     /// The unit name is part of the user's interface — they type it into
@@ -76,6 +96,15 @@ impl Service {
         let working_dir = systemd_value(working_dir);
         let name = self.hub.name();
         let description = self.description;
+        // Empty when nothing is declared, so a product that declares no variables
+        // gets a unit byte-identical to one from before this existed.
+        let environment: String = self
+            .env
+            .iter()
+            .map(|(key, value)| {
+                format!("Environment={}\n", systemd_value(&format!("{key}={value}")))
+            })
+            .collect();
         format!(
             "[Unit]\n\
              # Keep the hub resident so agent hosts always have a URL to connect to.\n\
@@ -94,6 +123,7 @@ impl Service {
              Type=simple\n\
              ExecStart={exe} serve --port {port}\n\
              WorkingDirectory={working_dir}\n\
+             {environment}\
              \n\
              # A host crash must not take this down; neither should a crash of its own.\n\
              Restart=always\n\
@@ -394,6 +424,47 @@ mod tests {
         assert!(other
             .unit_contents("/usr/bin/otherprod", 7988, "/home/x")
             .contains("SyslogIdentifier=otherprod-serve"));
+    }
+
+    /// A product that gates its own `serve` behind an environment variable needs
+    /// the unit to set it: the systemd user manager inherits nothing from the
+    /// shell that ran the install, so without this the service is rejected by
+    /// that product's own gate at every start.
+    #[test]
+    fn declared_environment_reaches_the_unit_in_order() {
+        let service = SERVICE.with_env(&[("PROD_CLI", "1"), ("PROD_MODE", "hub")]);
+        let unit = service.unit_contents("/usr/bin/testprod", 7977, "/home/x");
+        assert!(unit.contains("Environment=PROD_CLI=1"), "{unit}");
+        assert!(unit.contains("Environment=PROD_MODE=hub"), "{unit}");
+        let first = unit.find("PROD_CLI").unwrap();
+        let second = unit.find("PROD_MODE").unwrap();
+        assert!(
+            first < second,
+            "declaration order must be preserved: {unit}"
+        );
+        // They belong to the service section, where systemd reads them.
+        let service_section = &unit[unit.find("[Service]").unwrap()..];
+        assert!(service_section.contains("Environment=PROD_CLI=1"), "{unit}");
+    }
+
+    /// An awkward value must be escaped exactly as ExecStart's is, or it silently
+    /// becomes several arguments or a systemd specifier.
+    #[test]
+    fn an_awkward_environment_value_is_escaped_like_every_other_unit_value() {
+        let service = SERVICE.with_env(&[("PROD_DIR", "/opt/my prod/100%")]);
+        let unit = service.unit_contents("/usr/bin/testprod", 7977, "/home/x");
+        assert!(
+            unit.contains("Environment=\"PROD_DIR=/opt/my prod/100%%\""),
+            "{unit}"
+        );
+    }
+
+    /// Ishoo declares no variables, so its installed unit must be untouched by
+    /// this feature existing.
+    #[test]
+    fn a_service_with_no_environment_emits_no_environment_line() {
+        let unit = SERVICE.unit_contents("/usr/bin/testprod", 7977, "/home/x");
+        assert!(!unit.contains("Environment="), "{unit}");
     }
 
     /// The description is the product's, not a generic one: it is what the user
