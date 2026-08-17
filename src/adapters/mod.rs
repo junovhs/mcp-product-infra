@@ -1332,8 +1332,47 @@ fn claude_server_json(server: &HostServer) -> Value {
     Value::Object(entry)
 }
 
-/// Does this config entry express exactly this transport?
-fn codex_matches_transport(table: &toml::Table, transport: &HostTransport) -> bool {
+/// How exactly an entry's transport has to line up with the one we declare.
+///
+/// Ownership and currency ask different questions of the same entry, and the
+/// difference is not cosmetic: an HTTP registration's URL carries a `?root=`
+/// query pinning an absolute repository path (ADPT-14), which is a fact about
+/// one machine's filesystem. Judging ownership on the whole URL therefore makes
+/// a config authored on another machine — a colleague's checkout, a second
+/// machine, any clone at a different path — read as a stranger's entry, so the
+/// installer skips it and can never repair it. The user sees `enable` report
+/// the file `unchanged` while readiness simultaneously reports it `shadowed`.
+///
+/// Stdio has always drawn this line in the same place: `command_name_matches`
+/// compares file names precisely because the absolute path to the executable is
+/// machine-local too. [`MatchPrecision::Identity`] is that existing principle
+/// applied to the HTTP transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatchPrecision {
+    /// Is this the same server, ignoring the parts that legitimately differ from
+    /// one machine to the next? This is the ownership question.
+    Identity,
+    /// Is this byte-for-byte the registration we write today? This is the
+    /// currency question, and a stale root must fail it so the entry is rewritten.
+    Exact,
+}
+
+/// The part of an HTTP registration URL that identifies the *server* rather than
+/// the machine: everything before the query string. The query holds `?root=`,
+/// which differs per checkout and must not decide ownership.
+fn http_identity(url: &str) -> &str {
+    match url.split_once('?') {
+        Some((identity, _)) => identity,
+        None => url,
+    }
+}
+
+/// Does this config entry express this transport, at the requested precision?
+fn codex_matches_transport(
+    table: &toml::Table,
+    transport: &HostTransport,
+    precision: MatchPrecision,
+) -> bool {
     match transport {
         HostTransport::Stdio { command, args } => {
             // A stdio entry must not also carry a url: Codex picks stdio when a
@@ -1354,12 +1393,18 @@ fn codex_matches_transport(table: &toml::Table, transport: &HostTransport) -> bo
                             .eq(args.iter().map(String::as_str))
                     })
         }
-        // Ownership of an HTTP entry is the URL alone. The header table holds a
+        // An HTTP entry is judged on its URL alone. The header table holds a
         // bearer token rotated independently of the config, so comparing it would
         // make every rotation read as foreign drift.
         HostTransport::Http { url, .. } => {
+            let Some(actual) = table.get("url").and_then(|v| v.as_str()) else {
+                return false;
+            };
             table.get("command").is_none()
-                && table.get("url").and_then(|v| v.as_str()) == Some(url.as_str())
+                && match precision {
+                    MatchPrecision::Identity => http_identity(actual) == http_identity(url),
+                    MatchPrecision::Exact => actual == url,
+                }
         }
     }
 }
@@ -1371,14 +1416,18 @@ fn codex_server_is_owned(value: &toml::Value, expected: &HostServer) -> bool {
     let Some(table) = value.as_table() else {
         return false;
     };
-    codex_matches_transport(table, &expected.transport)
+    codex_matches_transport(table, &expected.transport, MatchPrecision::Identity)
         || expected
             .superseded
             .iter()
-            .any(|previous| codex_matches_transport(table, previous))
+            .any(|previous| codex_matches_transport(table, previous, MatchPrecision::Identity))
 }
 
-fn claude_matches_transport(value: &Value, transport: &HostTransport) -> bool {
+fn claude_matches_transport(
+    value: &Value,
+    transport: &HostTransport,
+    precision: MatchPrecision,
+) -> bool {
     match transport {
         HostTransport::Stdio { command, args } => {
             let stdio_or_absent = match value.get("type").and_then(|v| v.as_str()) {
@@ -1401,18 +1450,24 @@ fn claude_matches_transport(value: &Value, transport: &HostTransport) -> bool {
                     })
         }
         HostTransport::Http { url, .. } => {
+            let Some(actual) = value.get("url").and_then(|v| v.as_str()) else {
+                return false;
+            };
             value.get("type").and_then(|v| v.as_str()) == Some("http")
-                && value.get("url").and_then(|v| v.as_str()) == Some(url.as_str())
+                && match precision {
+                    MatchPrecision::Identity => http_identity(actual) == http_identity(url),
+                    MatchPrecision::Exact => actual == url,
+                }
         }
     }
 }
 
 fn claude_server_is_owned(value: &Value, expected: &HostServer) -> bool {
-    claude_matches_transport(value, &expected.transport)
+    claude_matches_transport(value, &expected.transport, MatchPrecision::Identity)
         || expected
             .superseded
             .iter()
-            .any(|previous| claude_matches_transport(value, previous))
+            .any(|previous| claude_matches_transport(value, previous, MatchPrecision::Identity))
 }
 
 /// The exact top-level keys the current rendering emits for `server`.
@@ -1470,7 +1525,7 @@ fn expected_claude_keys(server: &HostServer) -> BTreeSet<&'static str> {
 /// stale and must be rewritten, so `install_repo` converges on our rendering
 /// instead of merely being satisfied by it.
 fn codex_entry_is_current(table: &toml::Table, server: &HostServer) -> bool {
-    codex_matches_transport(table, &server.transport)
+    codex_matches_transport(table, &server.transport, MatchPrecision::Exact)
         && table.keys().map(String::as_str).collect::<BTreeSet<_>>() == expected_codex_keys(server)
 }
 
@@ -1478,7 +1533,7 @@ fn claude_entry_is_current(value: &Value, server: &HostServer) -> bool {
     let Some(object) = value.as_object() else {
         return false;
     };
-    claude_matches_transport(value, &server.transport)
+    claude_matches_transport(value, &server.transport, MatchPrecision::Exact)
         && object.keys().map(String::as_str).collect::<BTreeSet<_>>()
             == expected_claude_keys(server)
 }
@@ -1847,6 +1902,139 @@ mod tests {
             raw,
             "re-running over a converged file must change nothing"
         );
+    }
+
+    /// ADPT-08 — the exact live case: a `.codex/config.toml` committed on a Linux
+    /// checkout and pulled onto a Windows machine. The URL differs only in the
+    /// `?root=` query, which pins an absolute repository path. Ownership was
+    /// whole-URL equality, so the entry read as a stranger's, `enable` skipped it
+    /// and reported the file `unchanged` while readiness reported it `shadowed` —
+    /// leaving Codex pointed at a path that does not exist on this machine, with
+    /// no command able to repair it.
+    #[test]
+    fn a_repo_codex_entry_rooted_on_another_machine_is_owned_and_reroots() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        fs::write(
+            dir.path().join(".codex/config.toml"),
+            concat!(
+                "# a comment the user wrote\n",
+                "[mcp_servers.other]\n",
+                "url = \"http://127.0.0.1:9999/mcp?root=/home/juno/todo\"\n",
+                "\n",
+                "[mcp_servers.todo]\n",
+                "url = \"http://127.0.0.1:7977/mcp?root=/home/juno/todo\"\n",
+            ),
+        )
+        .unwrap();
+
+        let local = "http://127.0.0.1:7977/mcp?root=C:/Users/dev/todo";
+        HostInstall::new("todo")
+            .server(HostServer::http("todo", local))
+            .install_repo(dir.path())
+            .unwrap();
+
+        let raw = fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
+        let doc: toml::Table = raw.parse().expect("codex config stays valid TOML");
+        assert_eq!(
+            doc["mcp_servers"]["todo"]["url"].as_str(),
+            Some(local),
+            "the foreign root must be rewritten to this machine's: {raw}"
+        );
+        assert!(
+            doc["mcp_servers"]["todo"]["url"]
+                .as_str()
+                .is_some_and(|url| !url.contains("/home/juno")),
+            "no trace of the other machine's root on our entry: {raw}"
+        );
+
+        // A server at a different port is a different server, not a stale copy of
+        // ours: its machine-local root must survive untouched.
+        assert_eq!(
+            doc["mcp_servers"]["other"]["url"].as_str(),
+            Some("http://127.0.0.1:9999/mcp?root=/home/juno/todo"),
+            "a foreign server must not be re-rooted: {raw}"
+        );
+        assert!(raw.contains("# a comment the user wrote"), "{raw}");
+
+        // Converged: a second run is a byte-identical no-op.
+        HostInstall::new("todo")
+            .server(HostServer::http("todo", local))
+            .install_repo(dir.path())
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap(),
+            raw,
+            "re-running over a converged file must change nothing"
+        );
+    }
+
+    /// Ownership ignores the machine-local query, but currency must not: an entry
+    /// whose root is stale has to read as NOT current, or it would be recognized
+    /// as ours and then left exactly as it was — the same dead end by another
+    /// route. This pins the two predicates apart.
+    #[test]
+    fn a_stale_root_is_owned_but_not_current() {
+        let server = HostServer::http("todo", "http://127.0.0.1:7977/mcp?root=C:/Users/dev/todo");
+        let stale: toml::Table = "url = \"http://127.0.0.1:7977/mcp?root=/home/juno/todo\"\n"
+            .parse()
+            .unwrap();
+        let foreign: toml::Table = "url = \"http://127.0.0.1:9999/mcp?root=/home/juno/todo\"\n"
+            .parse()
+            .unwrap();
+
+        assert!(
+            codex_server_is_owned(&toml::Value::Table(stale.clone()), &server),
+            "an entry differing only in ?root= is ours"
+        );
+        assert!(
+            !codex_entry_is_current(&stale, &server),
+            "...but it is not current, so it gets rewritten"
+        );
+        assert!(
+            !codex_server_is_owned(&toml::Value::Table(foreign), &server),
+            "a different port is a different server"
+        );
+    }
+
+    /// The Claude Code half of the same defect. Ishoo's rooted registration lives
+    /// in the user's private per-project scope (ADPT-14), which is exactly where a
+    /// root from a previous machine or a moved checkout goes stale.
+    #[test]
+    fn a_claude_entry_rooted_on_another_machine_is_owned_and_reroots() {
+        let local = "http://127.0.0.1:7977/mcp?root=C:/Users/dev/todo";
+        let server = HostServer::http("todo", local);
+        let stale = json!({
+            "type": "http",
+            "url": "http://127.0.0.1:7977/mcp?root=/home/juno/todo"
+        });
+        let foreign = json!({
+            "type": "http",
+            "url": "http://127.0.0.1:9999/mcp?root=/home/juno/todo"
+        });
+
+        assert!(claude_server_is_owned(&stale, &server));
+        assert!(!claude_entry_is_current(&stale, &server));
+        assert!(!claude_server_is_owned(&foreign, &server));
+    }
+
+    /// A URL with no query at all still compares correctly — the user-scope
+    /// registration is deliberately unrooted, and it must not suddenly match every
+    /// rooted entry or fail to match itself.
+    #[test]
+    fn an_unrooted_url_matches_itself_and_not_a_different_server() {
+        assert_eq!(
+            http_identity("http://127.0.0.1:7977/mcp"),
+            "http://127.0.0.1:7977/mcp"
+        );
+        assert_eq!(
+            http_identity("http://127.0.0.1:7977/mcp?root=C:/x"),
+            "http://127.0.0.1:7977/mcp"
+        );
+        let server = HostServer::http("todo", "http://127.0.0.1:7977/mcp");
+        let unrooted: toml::Table = "url = \"http://127.0.0.1:7977/mcp\"\n".parse().unwrap();
+        assert!(codex_entry_is_current(&unrooted, &server));
     }
 
     /// The `.mcp.json` half of the same defect.
