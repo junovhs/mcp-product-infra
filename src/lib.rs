@@ -17,6 +17,7 @@ pub mod registry;
 pub mod resources;
 pub mod response;
 pub mod server;
+pub mod service;
 pub mod shell_guard;
 pub mod sidecar;
 pub mod types;
@@ -36,6 +37,7 @@ pub use registry::{RegistryDefect, ToolRegistry};
 pub use resources::{ResourceContent, ResourceEntry, ResourceProvider};
 pub use response::{error_frame, error_frame_for, error_frame_kinded, result_frame, tool_ok};
 pub use server::{BeforeToolHook, McpServer, MutationHook, OwnerProse, ServerConfig};
+pub use service::{Service, ServiceOutcome};
 pub use sidecar::{
     OwnerEndpoint, OwnerHealth, OwnerHealthAction, OwnerHealthReport, OwnerHealthState,
     OwnerRecovery, OwnerTransportError, RetiredOwner, SidecarConfig,
