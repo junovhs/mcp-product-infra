@@ -1,5 +1,5 @@
 [mcp_servers.ishoo]
-url = "http://127.0.0.1:7977/mcp"
+url = "http://127.0.0.1:7977/mcp?root=/home/juno/mcp-product-infra"
 
 [mcp_servers.ishoo.tools.ishoo_candidates]
 approval_mode = "approve"
