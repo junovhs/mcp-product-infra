@@ -56,6 +56,7 @@ pub struct Service {
     hub: Hub,
     description: &'static str,
     env: &'static [(&'static str, &'static str)],
+    systemd_runtime_dir_env: &'static [(&'static str, &'static str)],
 }
 
 impl Service {
@@ -66,6 +67,7 @@ impl Service {
             hub,
             description,
             env: &[],
+            systemd_runtime_dir_env: &[],
         }
     }
 
@@ -81,6 +83,22 @@ impl Service {
     /// product's own gate at every start.
     pub const fn with_env(mut self, env: &'static [(&'static str, &'static str)]) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Declare systemd-only environment variables whose values are paths below
+    /// the user runtime directory (`%t`), in the order given.
+    ///
+    /// The path is relative by construction: callers provide `keyring/ssh`, not
+    /// a raw systemd value. This lets the renderer insert exactly the one `%t`
+    /// specifier it owns while continuing to escape every `%`, `$`, quote, and
+    /// whitespace character supplied by the product. Other supervisor backends
+    /// ignore this declaration because `%t` is specifically systemd vocabulary.
+    pub const fn with_systemd_runtime_dir_env(
+        mut self,
+        env: &'static [(&'static str, &'static str)],
+    ) -> Self {
+        self.systemd_runtime_dir_env = env;
         self
     }
 
@@ -119,6 +137,16 @@ impl Service {
                 format!("Environment={}\n", systemd_value(&format!("{key}={value}")))
             })
             .collect();
+        let runtime_dir_environment: String = self
+            .systemd_runtime_dir_env
+            .iter()
+            .map(|(key, relative_path)| {
+                format!(
+                    "Environment={}\n",
+                    systemd_runtime_dir_environment(key, relative_path)
+                )
+            })
+            .collect();
         format!(
             "[Unit]\n\
              # Keep the hub resident so agent hosts always have a URL to connect to.\n\
@@ -138,6 +166,7 @@ impl Service {
              ExecStart={exe} serve --port {port}\n\
              WorkingDirectory={working_dir}\n\
              {environment}\
+             {runtime_dir_environment}\
              \n\
              # A host crash must not take this down; neither should a crash of its own.\n\
              Restart=always\n\
@@ -710,13 +739,37 @@ impl Service {
 /// arguments.
 fn systemd_value(raw: &str) -> String {
     let escaped = raw.replace('%', "%%").replace('$', "$$");
+    quote_systemd_value(&escaped)
+}
+
+/// Render one environment assignment rooted at systemd's per-user runtime
+/// directory while keeping the product-controlled key and suffix literal.
+fn systemd_runtime_dir_environment(key: &str, relative_path: &str) -> String {
+    assert!(
+        !key.is_empty() && key.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()),
+        "systemd environment key must contain only ASCII letters, digits, or underscores"
+    );
+    assert!(
+        !relative_path.starts_with('/')
+            && relative_path
+                .split('/')
+                .all(|component| !matches!(component, "" | "." | "..")),
+        "systemd runtime-directory path must be a normalized relative path"
+    );
+    let relative_path = relative_path.replace('%', "%%").replace('$', "$$");
+    quote_systemd_value(&format!("{key}=%t/{relative_path}"))
+}
+
+/// Add unit-file quoting after callers have decided which systemd expansions,
+/// if any, are intentional.
+fn quote_systemd_value(escaped: &str) -> String {
     if escaped
         .chars()
         .any(|c| c.is_whitespace() || c == '"' || c == '\\' || c == '\'')
     {
         format!("\"{}\"", escaped.replace('\\', "\\\\").replace('"', "\\\""))
     } else {
-        escaped
+        escaped.to_string()
     }
 }
 
@@ -988,6 +1041,32 @@ mod tests {
         let unit = service.unit_contents("/usr/bin/testprod", 7977, "/home/x");
         assert!(
             unit.contains("Environment=\"PROD_DIR=/opt/my prod/100%%\""),
+            "{unit}"
+        );
+    }
+
+    /// The runtime-directory declaration owns exactly one `%t`; escaping it to
+    /// `%%t` would leave a literal string and point SSH clients at a dead path.
+    #[test]
+    fn runtime_directory_environment_expands_only_the_owned_specifier() {
+        let service = SERVICE.with_systemd_runtime_dir_env(&[("SSH_AUTH_SOCK", "keyring/ssh")]);
+        let unit = service.unit_contents("/usr/bin/testprod", 7977, "/home/x");
+        assert!(
+            unit.contains("Environment=SSH_AUTH_SOCK=%t/keyring/ssh"),
+            "{unit}"
+        );
+        assert!(!unit.contains("SSH_AUTH_SOCK=%%t"), "{unit}");
+    }
+
+    /// Product-controlled percent and dollar characters remain literal even
+    /// when the renderer inserts a runtime-directory specifier beside them.
+    #[test]
+    fn runtime_directory_environment_still_escapes_the_relative_path() {
+        let service =
+            SERVICE.with_systemd_runtime_dir_env(&[("PROD_SOCKET", "my sockets/100%/$name")]);
+        let unit = service.unit_contents("/usr/bin/testprod", 7977, "/home/x");
+        assert!(
+            unit.contains("Environment=\"PROD_SOCKET=%t/my sockets/100%%/$$name\""),
             "{unit}"
         );
     }
