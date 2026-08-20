@@ -57,7 +57,7 @@ pub struct Service {
     description: &'static str,
     env: &'static [(&'static str, &'static str)],
     systemd_runtime_dir_env: &'static [(&'static str, &'static str)],
-    systemd_runtime_dir_env_comment: Option<&'static str>,
+    systemd_env_comment: Option<&'static str>,
 }
 
 impl Service {
@@ -69,7 +69,7 @@ impl Service {
             description,
             env: &[],
             systemd_runtime_dir_env: &[],
-            systemd_runtime_dir_env_comment: None,
+            systemd_env_comment: None,
         }
     }
 
@@ -104,15 +104,22 @@ impl Service {
         self
     }
 
-    /// Explain why the product needs its systemd runtime-directory environment.
+    /// Explain why the product needs its systemd environment declarations.
     ///
     /// Every line is rendered as a comment immediately before the typed
     /// `Environment=` declarations. Prefixing is performed by the renderer, so
     /// even directive-looking product text can never become executable unit
     /// configuration.
-    pub const fn with_systemd_runtime_dir_env_comment(mut self, comment: &'static str) -> Self {
-        self.systemd_runtime_dir_env_comment = Some(comment);
+    pub const fn with_systemd_env_comment(mut self, comment: &'static str) -> Self {
+        self.systemd_env_comment = Some(comment);
         self
+    }
+
+    /// Compatibility spelling for callers that only declare runtime-directory
+    /// environment. The comment is shared so it also remains present when a
+    /// product must fall back to an exact systemd environment value.
+    pub const fn with_systemd_runtime_dir_env_comment(self, comment: &'static str) -> Self {
+        self.with_systemd_env_comment(comment)
     }
 
     /// The unit name is part of the user's interface — they type it into
@@ -160,9 +167,9 @@ impl Service {
                 )
             })
             .collect();
-        let runtime_dir_environment_comment = self
-            .systemd_runtime_dir_env_comment
-            .filter(|_| !self.systemd_runtime_dir_env.is_empty())
+        let systemd_environment_comment = self
+            .systemd_env_comment
+            .filter(|_| !self.env.is_empty() || !self.systemd_runtime_dir_env.is_empty())
             .map(systemd_comment)
             .unwrap_or_default();
         format!(
@@ -183,8 +190,8 @@ impl Service {
              Type=simple\n\
              ExecStart={exe} serve --port {port}\n\
              WorkingDirectory={working_dir}\n\
+             {systemd_environment_comment}\
              {environment}\
-             {runtime_dir_environment_comment}\
              {runtime_dir_environment}\
              \n\
              # A host crash must not take this down; neither should a crash of its own.\n\
@@ -1114,13 +1121,33 @@ mod tests {
         assert!(!unit.contains("\nRestart=never\n"), "{unit}");
     }
 
+    /// Exact systemd environment values need the same durable rationale as
+    /// runtime-directory values, including for agents such as 1Password whose
+    /// sockets live elsewhere.
+    #[test]
+    fn exact_environment_comment_is_preserved_and_inert() {
+        let service = SERVICE
+            .with_env(&[("SSH_AUTH_SOCK", "/home/x/.1password/agent.sock")])
+            .with_systemd_env_comment("The resident process pushes over SSH.\nRestart=never");
+        let unit = service.unit_contents("/usr/bin/testprod", 7977, "/home/x");
+        assert!(
+            unit.contains(
+                "# The resident process pushes over SSH.\n# Restart=never\nEnvironment=SSH_AUTH_SOCK=/home/x/.1password/agent.sock"
+            ),
+            "{unit}"
+        );
+        assert!(!unit.contains("\nRestart=never\n"), "{unit}");
+    }
+
     /// A comment with no typed declaration has nowhere meaningful to render.
     #[test]
     fn runtime_directory_environment_comment_alone_changes_nothing() {
         let plain = SERVICE.unit_contents("/usr/bin/testprod", 7977, "/home/x");
-        let commented = SERVICE
-            .with_systemd_runtime_dir_env_comment("unused")
-            .unit_contents("/usr/bin/testprod", 7977, "/home/x");
+        let commented = SERVICE.with_systemd_env_comment("unused").unit_contents(
+            "/usr/bin/testprod",
+            7977,
+            "/home/x",
+        );
         assert_eq!(commented, plain);
     }
 
