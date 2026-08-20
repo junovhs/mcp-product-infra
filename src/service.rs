@@ -57,6 +57,7 @@ pub struct Service {
     description: &'static str,
     env: &'static [(&'static str, &'static str)],
     systemd_runtime_dir_env: &'static [(&'static str, &'static str)],
+    systemd_runtime_dir_env_comment: Option<&'static str>,
 }
 
 impl Service {
@@ -68,6 +69,7 @@ impl Service {
             description,
             env: &[],
             systemd_runtime_dir_env: &[],
+            systemd_runtime_dir_env_comment: None,
         }
     }
 
@@ -99,6 +101,17 @@ impl Service {
         env: &'static [(&'static str, &'static str)],
     ) -> Self {
         self.systemd_runtime_dir_env = env;
+        self
+    }
+
+    /// Explain why the product needs its systemd runtime-directory environment.
+    ///
+    /// Every line is rendered as a comment immediately before the typed
+    /// `Environment=` declarations. Prefixing is performed by the renderer, so
+    /// even directive-looking product text can never become executable unit
+    /// configuration.
+    pub const fn with_systemd_runtime_dir_env_comment(mut self, comment: &'static str) -> Self {
+        self.systemd_runtime_dir_env_comment = Some(comment);
         self
     }
 
@@ -147,6 +160,11 @@ impl Service {
                 )
             })
             .collect();
+        let runtime_dir_environment_comment = self
+            .systemd_runtime_dir_env_comment
+            .filter(|_| !self.systemd_runtime_dir_env.is_empty())
+            .map(systemd_comment)
+            .unwrap_or_default();
         format!(
             "[Unit]\n\
              # Keep the hub resident so agent hosts always have a URL to connect to.\n\
@@ -166,6 +184,7 @@ impl Service {
              ExecStart={exe} serve --port {port}\n\
              WorkingDirectory={working_dir}\n\
              {environment}\
+             {runtime_dir_environment_comment}\
              {runtime_dir_environment}\
              \n\
              # A host crash must not take this down; neither should a crash of its own.\n\
@@ -760,6 +779,11 @@ fn systemd_runtime_dir_environment(key: &str, relative_path: &str) -> String {
     quote_systemd_value(&format!("{key}=%t/{relative_path}"))
 }
 
+/// Render product prose as comments only; no line can escape into unit syntax.
+fn systemd_comment(comment: &str) -> String {
+    comment.lines().map(|line| format!("# {line}\n")).collect()
+}
+
 /// Add unit-file quoting after callers have decided which systemd expansions,
 /// if any, are intentional.
 fn quote_systemd_value(escaped: &str) -> String {
@@ -1069,6 +1093,35 @@ mod tests {
             unit.contains("Environment=\"PROD_SOCKET=%t/my sockets/100%%/$$name\""),
             "{unit}"
         );
+    }
+
+    /// The explanation stays adjacent to the declaration, and text resembling
+    /// a unit directive remains inert product prose.
+    #[test]
+    fn runtime_directory_environment_comment_cannot_become_a_directive() {
+        let service = SERVICE
+            .with_systemd_runtime_dir_env(&[("SSH_AUTH_SOCK", "keyring/ssh")])
+            .with_systemd_runtime_dir_env_comment(
+                "The resident process pushes over SSH.\nRestart=never",
+            );
+        let unit = service.unit_contents("/usr/bin/testprod", 7977, "/home/x");
+        assert!(
+            unit.contains(
+                "# The resident process pushes over SSH.\n# Restart=never\nEnvironment=SSH_AUTH_SOCK=%t/keyring/ssh"
+            ),
+            "{unit}"
+        );
+        assert!(!unit.contains("\nRestart=never\n"), "{unit}");
+    }
+
+    /// A comment with no typed declaration has nowhere meaningful to render.
+    #[test]
+    fn runtime_directory_environment_comment_alone_changes_nothing() {
+        let plain = SERVICE.unit_contents("/usr/bin/testprod", 7977, "/home/x");
+        let commented = SERVICE
+            .with_systemd_runtime_dir_env_comment("unused")
+            .unit_contents("/usr/bin/testprod", 7977, "/home/x");
+        assert_eq!(commented, plain);
     }
 
     /// Ishoo declares no variables, so its installed unit must be untouched by
