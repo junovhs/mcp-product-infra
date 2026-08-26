@@ -10,3 +10,7 @@
 {"cycle_id":1784565815032,"seq":1,"step":"fetch","state":"ok","at":"2026-07-20T16:43:36.4601545Z","ref_name":"origin/main","to_sha":"8c85e42a995682570a37ff76d548ab8c58fced7b"}
 {"cycle_id":1784565815032,"seq":2,"step":"reconcile_store","state":"started","at":"2026-07-20T16:43:36.5352484Z","ref_name":"refs/ishoo/store","from_sha":"c682d4f604d686758da788e224a315cabb28e16b"}
 {"cycle_id":1784565815032,"seq":3,"step":"reconcile_store","state":"ok","at":"2026-07-20T16:43:37.9803893Z","ref_name":"refs/ishoo/store","from_sha":"c682d4f604d686758da788e224a315cabb28e16b","to_sha":"c682d4f604d686758da788e224a315cabb28e16b","detail":"already in step"}
+{"cycle_id":1787703327254,"seq":0,"step":"fetch","state":"started","at":"2026-08-26T00:15:27.2549951Z","ref_name":"main"}
+{"cycle_id":1787703327254,"seq":1,"step":"fetch","state":"ok","at":"2026-08-26T00:15:28.7136014Z","ref_name":"origin/main","to_sha":"f3206eba96a2b664a147c7d06c4263c44c28b291"}
+{"cycle_id":1787703327254,"seq":2,"step":"reconcile_store","state":"started","at":"2026-08-26T00:15:28.8295874Z","ref_name":"refs/ishoo/store","from_sha":"b41d2e467632cf8161d823a37b3cdc5c78f80e5d"}
+{"cycle_id":1787703327254,"seq":3,"step":"reconcile_store","state":"ok","at":"2026-08-26T00:15:30.3534273Z","ref_name":"refs/ishoo/store","from_sha":"b41d2e467632cf8161d823a37b3cdc5c78f80e5d","to_sha":"b41d2e467632cf8161d823a37b3cdc5c78f80e5d","detail":"already in step"}
