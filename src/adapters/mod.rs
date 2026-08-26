@@ -1006,8 +1006,24 @@ pub struct HostReadinessReport {
     /// `user` | `repository` | `both` | `none`.
     pub effective_source: String,
     /// `reachable` | `unreachable` | `unchecked`.
+    ///
+    /// Always `unchecked` today: nothing in this crate probes a host. Callers
+    /// reach this report over the very transport whose health it would describe,
+    /// so its arrival is already stronger proof of reachability than a probe
+    /// could give, and a broken transport yields no report at all.
     pub connectivity: String,
-    pub ready: bool,
+    /// Whether the expected registration was found in the inspected config, and
+    /// nothing more (ADPT-11).
+    ///
+    /// Deliberately NOT named `ready`. DEC-03 keeps process liveness, transport
+    /// reachability, and application readiness as distinct states; this is a
+    /// purely textual read of config files, so calling it readiness collapses
+    /// reachability into configuration. On 2026-08-16 a host that could not
+    /// authenticate at all reported `ready: true` / `ready_both` — every fact in
+    /// the report was correct and only the word on top of them was false.
+    pub configured: bool,
+    /// `configured_both` | `configured_globally` | `configured_repository` |
+    /// `setup_required` | `repository_override_blocks_global`.
     pub result: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_action: Option<String>,
@@ -1634,7 +1650,7 @@ fn build_readiness(
         );
 
     let mut repository_adapter = repository_adapter;
-    let (effective_source, ready, result, primary_action, secondary_action) = if repo_blocks_user {
+    let (effective_source, configured, result, primary_action, secondary_action) = if repo_blocks_user {
         repository_adapter.state = "shadowed".to_string();
         if repository_adapter.detail.is_none() {
             repository_adapter.detail = Some(
@@ -1652,7 +1668,7 @@ fn build_readiness(
         (
             "both",
             true,
-            "ready_both",
+            "configured_both",
             None,
             Some("Add shared repository setup".to_string()),
         )
@@ -1660,12 +1676,12 @@ fn build_readiness(
         (
             "user",
             true,
-            "ready_globally",
+            "configured_globally",
             None,
             Some("Add shared repository setup".to_string()),
         )
     } else if repo_current {
-        ("repository", true, "ready_repository", None, None)
+        ("repository", true, "configured_repository", None, None)
     } else {
         (
             "none",
@@ -1682,7 +1698,7 @@ fn build_readiness(
         repository_adapter,
         effective_source: effective_source.to_string(),
         connectivity: "unchecked".to_string(),
-        ready,
+        configured,
         result: result.to_string(),
         primary_action,
         secondary_action,
@@ -2500,7 +2516,7 @@ mod tests {
             &codex,
             &claude,
         );
-        assert!(global.iter().all(|report| report.ready));
+        assert!(global.iter().all(|report| report.configured));
         assert!(global
             .iter()
             .all(|report| report.effective_source == "user"));
@@ -2512,8 +2528,60 @@ mod tests {
             &codex,
             &claude,
         );
-        assert!(both.iter().all(|report| report.ready));
+        assert!(both.iter().all(|report| report.configured));
         assert!(both.iter().all(|report| report.effective_source == "both"));
+    }
+
+    /// ADPT-11 (DEC-03): the verdict may only claim what config inspection can
+    /// prove. Nothing in this crate contacts a host, so no report may say it is
+    /// ready — it says it is configured, and connectivity stays `unchecked`.
+    ///
+    /// This is the regression for the 2026-08-16 false green, where a host that
+    /// could not authenticate at all reported `ready: true` / `ready_both`.
+    /// Asserting over the serialized form rather than the struct keeps the
+    /// promise where consumers actually read it.
+    #[test]
+    fn readiness_never_claims_ready_from_config_inspection_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let codex = dir.path().join("codex.toml");
+        let claude = dir.path().join("claude.json");
+        let repo_install =
+            || HostInstall::new("todo").server(HostServer::stdio("todo", "todo", ["mcp"]));
+        let user_install =
+            || HostInstall::new("todo").server(HostServer::stdio("todo", "todo", ["mcp", "--hub"]));
+
+        user_install().install_user_at(&codex, &claude).unwrap();
+        repo_install().install_repo(dir.path()).unwrap();
+        let reports = repo_install().readiness_at_with_user_install(
+            &user_install(),
+            dir.path(),
+            &codex,
+            &claude,
+        );
+
+        assert!(!reports.is_empty(), "fixture must produce host reports");
+        for report in &reports {
+            // The fully-configured case is exactly the one that used to lie.
+            assert!(report.configured, "fixture is fully configured: {report:?}");
+            assert_eq!(report.result, "configured_both");
+            assert_eq!(
+                report.connectivity, "unchecked",
+                "nothing here probes a host, so connectivity cannot be anything else"
+            );
+
+            let json = serde_json::to_value(report).expect("report serializes");
+            let object = json.as_object().expect("report is a JSON object");
+            assert!(
+                !object.contains_key("ready"),
+                "no consumer may read a `ready` field off config inspection: {json}"
+            );
+            let result = object["result"].as_str().unwrap_or_default();
+            assert!(
+                !result.starts_with("ready"),
+                "verdict must not claim readiness: {result}"
+            );
+        }
     }
 
     #[test]
@@ -2567,7 +2635,7 @@ mod tests {
             .iter()
             .find(|report| report.host == "Codex")
             .expect("codex readiness fact");
-        assert!(codex.ready, "http entry must read as ready: {codex:?}");
+        assert!(codex.configured, "http entry must read as configured: {codex:?}");
         assert_eq!(codex.repository_adapter.state, "current");
 
         // A rotated bearer token must not turn our own entry into foreign drift:
@@ -3129,7 +3197,7 @@ mod tests {
             claude.repository_adapter.state, "drifted",
             "a deliberately withheld server is not drift: {claude:?}"
         );
-        assert!(claude.ready, "user registration is good: {claude:?}");
+        assert!(claude.configured, "user registration is good: {claude:?}");
     }
 
     /// ADPT-05 — the composition rule is the reason the rest of this exists, so it
