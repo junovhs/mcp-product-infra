@@ -398,11 +398,27 @@ impl HostInstall {
         claude_json: &Path,
         project_root: &Path,
     ) -> Result<InstallReport, String> {
-        let key = effective_project_key(claude_json, project_root);
+        // ADPT-13: write under the host's key, then take our servers out of any
+        // OTHER entry naming this same root, so a project set up again heals the
+        // twin a pre-ADPT-12 install left behind. Scoped to this one root -- never
+        // a sweep of the `projects` map.
+        let equivalent = equivalent_project_keys(claude_json, project_root);
+        let key = equivalent
+            .first()
+            .cloned()
+            .unwrap_or_else(|| project_scope_key(project_root));
+        let stale: Vec<String> = equivalent.iter().filter(|k| *k != &key).cloned().collect();
         let files = vec![(
             format!("{} [{}]", claude_json.display(), key),
             with_action(claude_json, || {
-                self.ensure_claude_project_config(claude_json, &key)
+                let written = self.ensure_claude_project_config(claude_json, &key)?;
+                if matches!(written, Materialized::Skipped(_)) {
+                    return Ok(written);
+                }
+                if !stale.is_empty() {
+                    self.remove_claude_project_config(claude_json, &stale)?;
+                }
+                Ok(written)
             })?,
         )];
         Ok(InstallReport {
@@ -417,11 +433,16 @@ impl HostInstall {
         claude_json: &Path,
         project_root: &Path,
     ) -> Result<InstallReport, String> {
-        let key = effective_project_key(claude_json, project_root);
+        // Every spelling of this root, not just the one install would choose.
+        let keys = equivalent_project_keys(claude_json, project_root);
+        let label = keys
+            .first()
+            .cloned()
+            .unwrap_or_else(|| project_scope_key(project_root));
         let files = vec![(
-            format!("{} [{}]", claude_json.display(), key),
+            format!("{} [{}]", claude_json.display(), label),
             with_action(claude_json, || {
-                self.remove_claude_project_config(claude_json, &key)
+                self.remove_claude_project_config(claude_json, &keys)
             })?,
         )];
         Ok(InstallReport {
@@ -826,7 +847,19 @@ impl HostInstall {
         Ok(Materialized::Wrote)
     }
 
-    fn remove_claude_project_config(&self, path: &Path, key: &str) -> Result<Materialized, String> {
+    /// Remove our servers from EVERY entry naming this root, and drop an entry
+    /// that was only ever ours and is now empty.
+    ///
+    /// ADPT-13: acting on one key left our servers behind in the other spelling,
+    /// so uninstall left exactly what it exists to remove. The delete is gated on
+    /// the verbatim prefix, a spelling the host never writes, so this can only
+    /// ever reach an entry an older version of this crate created. An entry
+    /// holding anything else keeps its shape and merely loses our servers.
+    fn remove_claude_project_config(
+        &self,
+        path: &Path,
+        keys: &[String],
+    ) -> Result<Materialized, String> {
         let existing = match fs::read_to_string(path) {
             Ok(v) => v,
             Err(_) => return Ok(Materialized::Skipped("not present".to_string())),
@@ -840,13 +873,30 @@ impl HostInstall {
                 )))
             }
         };
-        let changed = doc
-            .get_mut("projects")
-            .and_then(|v| v.as_object_mut())
-            .and_then(|projects| projects.get_mut(key))
-            .and_then(|project| project.get_mut("mcpServers"))
-            .and_then(|v| v.as_object_mut())
-            .is_some_and(|servers| remove_owned_claude_servers(servers, &self.servers));
+        let mut changed = false;
+        if let Some(projects) = doc.get_mut("projects").and_then(|v| v.as_object_mut()) {
+            let mut ours_and_empty = Vec::new();
+            for key in keys {
+                let Some(entry) = projects.get_mut(key).and_then(|v| v.as_object_mut()) else {
+                    continue;
+                };
+                let only_field = entry.keys().all(|field| field == "mcpServers");
+                let Some(servers) = entry.get_mut("mcpServers").and_then(|v| v.as_object_mut())
+                else {
+                    continue;
+                };
+                if remove_owned_claude_servers(servers, &self.servers) {
+                    changed = true;
+                }
+                if servers.is_empty() && only_field && key.starts_with(VERBATIM_PREFIX) {
+                    ours_and_empty.push(key.clone());
+                }
+            }
+            for key in ours_and_empty {
+                projects.remove(&key);
+                changed = true;
+            }
+        }
         if changed {
             write_json(path, &doc)?;
         }
@@ -1315,38 +1365,57 @@ fn normalized_project_key(key: &str) -> String {
 ///
 /// Reading the config here (rather than inside the mutating helpers) keeps the
 /// reported file label naming the key that is really used.
-fn effective_project_key(claude_json: &Path, project_root: &Path) -> String {
-    let key = project_scope_key(project_root);
-    let Ok(existing) = fs::read_to_string(claude_json) else {
-        return key;
+/// The Windows verbatim prefix. A key carrying it was written by an older
+/// version of THIS crate: measured on a real profile, 0 of 46 host-written
+/// `projects` keys used it and all 8 that did were ours. That is what makes it
+/// safe to treat such a key as our own litter (ADPT-13).
+const VERBATIM_PREFIX: &str = r"\\?\";
+
+/// Do two `projects` keys name one directory?
+///
+/// String normalization first, then the filesystem, because 8.3 short names,
+/// junctions and symlinks cannot be reconciled by any string rule.
+fn keys_name_one_directory(candidate: &str, own_key: &str, canonical: Option<&Path>) -> bool {
+    if normalized_project_key(candidate) == normalized_project_key(own_key) {
+        return true;
+    }
+    match (canonical, fs::canonicalize(Path::new(candidate))) {
+        (Some(wanted), Ok(found)) => found == wanted,
+        _ => false,
+    }
+}
+
+/// EVERY existing `projects` key naming this root, in map order.
+///
+/// Install needs one key; removal needs all of them, because a pre-ADPT-12
+/// install left a second entry under the verbatim spelling and uninstall must
+/// not leave our servers sitting in it.
+fn equivalent_project_keys(claude_json: &Path, project_root: &Path) -> Vec<String> {
+    let own = project_scope_key(project_root);
+    let canonical = fs::canonicalize(project_root).ok();
+    let Ok(text) = fs::read_to_string(claude_json) else {
+        return Vec::new();
     };
-    let Ok(doc) = serde_json::from_str::<Value>(&existing) else {
-        return key;
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
     };
     let Some(projects) = doc.get("projects").and_then(|v| v.as_object()) else {
-        return key;
+        return Vec::new();
     };
-
-    // Two spellings can name one directory in ways no string rule can bridge:
-    // Windows 8.3 short names (`C:\Users\SPENCE~1\...` for
-    // `C:\Users\SpencerNunamakerTrav\...`), junctions, and symlinks.
-    // Only the filesystem can settle those, so ask it first and keep the string
-    // comparison for keys that no longer exist on disk.
-    let canonical = fs::canonicalize(project_root).ok();
-    let normalized = normalized_project_key(&key);
     projects
         .keys()
-        .find(|candidate| {
-            if normalized_project_key(candidate) == normalized {
-                return true;
-            }
-            match (&canonical, fs::canonicalize(Path::new(candidate))) {
-                (Some(wanted), Ok(found)) => &found == wanted,
-                _ => false,
-            }
-        })
+        .filter(|candidate| keys_name_one_directory(candidate, &own, canonical.as_deref()))
         .cloned()
-        .unwrap_or(key)
+        .collect()
+}
+
+/// The key to write under: an existing entry for this root when the host has
+/// one, else our own spelling.
+fn effective_project_key(claude_json: &Path, project_root: &Path) -> String {
+    equivalent_project_keys(claude_json, project_root)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| project_scope_key(project_root))
 }
 
 /// Upsert every declared server into one Claude `mcpServers` map.
@@ -3065,6 +3134,188 @@ mod tests {
         );
         assert!(projects[&as_written]["mcpServers"]["todo"].is_object());
         assert!(projects[&as_written]["mcpServers"]["node_repl"].is_object());
+    }
+
+    /// ADPT-13: the real shape a pre-ADPT-12 install left behind -- BOTH
+    /// spellings of one directory. Removal must clean our servers out of both,
+    /// drop the entry only we ever created, and leave the host's entry and its
+    /// unrelated contents alone.
+    #[test]
+    fn removal_cleans_every_spelling_and_drops_only_our_own_empty_entry() {
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let claude_json = home.path().join(".claude.json");
+
+        let host_key = project_scope_key(repo.path());
+        let legacy_key = format!("{}{}", VERBATIM_PREFIX, host_key.replace('/', r"\"));
+
+        fs::write(
+            &claude_json,
+            serde_json::to_string_pretty(&json!({
+                "projects": {
+                    // The host's own entry, with unrelated contents beside ours.
+                    host_key.clone(): {
+                        "allowedTools": ["Bash"],
+                        "mcpServers": {
+                            "todo": { "type": "http", "url": "http://127.0.0.1:7977/mcp" },
+                            "node_repl": { "command": "node" }
+                        }
+                    },
+                    // The twin an older version of this crate wrote: only ours.
+                    legacy_key.clone(): {
+                        "mcpServers": {
+                            "todo": { "type": "http", "url": "http://127.0.0.1:7977/mcp" }
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        HostInstall::new("todo")
+            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"))
+            .remove_user_project_at(&claude_json, repo.path())
+            .unwrap();
+
+        let doc: Value =
+            serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        let projects = doc["projects"].as_object().unwrap();
+
+        // Our litter is gone...
+        assert!(
+            !projects.contains_key(&legacy_key),
+            "the entry only we ever created, now empty, must be dropped; got {:?}",
+            projects.keys().collect::<Vec<_>>()
+        );
+        // ...the host's entry survives, minus only our server.
+        let entry = &projects[&host_key];
+        assert!(entry["mcpServers"].get("todo").is_none());
+        assert!(entry["mcpServers"]["node_repl"].is_object());
+        assert_eq!(entry["allowedTools"][0].as_str(), Some("Bash"));
+    }
+
+    /// The delete must never reach an entry the host created, even when our
+    /// removal leaves its `mcpServers` empty.
+    #[test]
+    fn an_emptied_host_entry_is_preserved_not_deleted() {
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let claude_json = home.path().join(".claude.json");
+        let host_key = project_scope_key(repo.path());
+
+        fs::write(
+            &claude_json,
+            serde_json::to_string_pretty(&json!({
+                "projects": {
+                    host_key.clone(): {
+                        "mcpServers": { "todo": { "type": "http", "url": "u" } }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        HostInstall::new("todo")
+            .server(HostServer::http("todo", "u"))
+            .remove_user_project_at(&claude_json, repo.path())
+            .unwrap();
+
+        let doc: Value =
+            serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert!(
+            doc["projects"].as_object().unwrap().contains_key(&host_key),
+            "a host-created entry must survive even when we empty it"
+        );
+    }
+
+    /// Setting a project up again heals the twin, without a migration pass.
+    #[test]
+    fn installing_removes_our_servers_from_the_legacy_twin() {
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let claude_json = home.path().join(".claude.json");
+        let host_key = project_scope_key(repo.path());
+        let legacy_key = format!("{}{}", VERBATIM_PREFIX, host_key.replace('/', r"\"));
+
+        fs::write(
+            &claude_json,
+            serde_json::to_string_pretty(&json!({
+                "projects": {
+                    host_key.clone(): { "mcpServers": {} },
+                    // Same URL as the live one: the twin was written by the same
+                    // code, only under the other key spelling. Ownership is decided
+                    // by transport identity, so this entry IS ours.
+                    legacy_key.clone(): {
+                        "mcpServers": {
+                            "todo": { "type": "http", "url": "http://127.0.0.1:7977/mcp" }
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        HostInstall::new("todo")
+            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"))
+            .install_user_project_at(&claude_json, repo.path())
+            .unwrap();
+
+        let doc: Value =
+            serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        let projects = doc["projects"].as_object().unwrap();
+        assert_eq!(
+            projects[&host_key]["mcpServers"]["todo"]["url"].as_str(),
+            Some("http://127.0.0.1:7977/mcp"),
+            "the live registration goes in the host's entry"
+        );
+        assert!(
+            !projects.contains_key(&legacy_key),
+            "the emptied twin must be gone; got {:?}",
+            projects.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// No-clobber still wins over cleanup: an entry under a verbatim key whose
+    /// transport is NOT ours belongs to someone else, and must survive both the
+    /// server removal and the empty-entry delete.
+    #[test]
+    fn a_foreign_server_under_a_legacy_key_is_never_removed() {
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let claude_json = home.path().join(".claude.json");
+        let host_key = project_scope_key(repo.path());
+        let legacy_key = format!("{}{}", VERBATIM_PREFIX, host_key.replace('/', r"\"));
+
+        fs::write(
+            &claude_json,
+            serde_json::to_string_pretty(&json!({
+                "projects": {
+                    legacy_key.clone(): {
+                        "mcpServers": {
+                            "todo": { "type": "http", "url": "http://somewhere.else/mcp" }
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        HostInstall::new("todo")
+            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"))
+            .remove_user_project_at(&claude_json, repo.path())
+            .unwrap();
+
+        let doc: Value =
+            serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert_eq!(
+            doc["projects"][&legacy_key]["mcpServers"]["todo"]["url"].as_str(),
+            Some("http://somewhere.else/mcp"),
+            "a server we do not own must survive, whatever the key spelling"
+        );
     }
 
     /// The whole point: installing into a profile that ALREADY has a plain-path
