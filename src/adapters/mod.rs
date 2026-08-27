@@ -398,7 +398,7 @@ impl HostInstall {
         claude_json: &Path,
         project_root: &Path,
     ) -> Result<InstallReport, String> {
-        let key = project_scope_key(project_root);
+        let key = effective_project_key(claude_json, project_root);
         let files = vec![(
             format!("{} [{}]", claude_json.display(), key),
             with_action(claude_json, || {
@@ -417,7 +417,7 @@ impl HostInstall {
         claude_json: &Path,
         project_root: &Path,
     ) -> Result<InstallReport, String> {
-        let key = project_scope_key(project_root);
+        let key = effective_project_key(claude_json, project_root);
         let files = vec![(
             format!("{} [{}]", claude_json.display(), key),
             with_action(claude_json, || {
@@ -1255,11 +1255,98 @@ fn codex_server_toml(server: &HostServer) -> toml::Value {
 ///
 /// Canonicalization is best-effort — a root that does not exist yet is keyed by
 /// the path as given rather than failing the install.
+/// The `projects` map key for one repository root.
+///
+/// ADPT-12: `fs::canonicalize` returns the Windows verbatim (`\?\`) form, which
+/// is NOT the spelling Claude Code keys its own `projects` map by. Writing the
+/// verbatim form created a SECOND entry for a directory the host already had,
+/// so the per-project registration was written somewhere the host never reads.
+/// Canonicalize (to resolve `.`, `..` and links, which is why it is here), then
+/// drop the prefix so the key is the ordinary absolute path.
 fn project_scope_key(project_root: &Path) -> String {
-    fs::canonicalize(project_root)
-        .unwrap_or_else(|_| project_root.to_path_buf())
-        .display()
-        .to_string()
+    let resolved = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let stripped = strip_verbatim_prefix(&resolved.display().to_string());
+    // Match the host's own spelling, not merely a valid one. Measured on a
+    // real profile: of 54 `projects` keys, 46 were `C:/Users/...` with forward
+    // slashes and none used backslashes -- the 8 that did were all ours, and
+    // all orphans. Writing backslashes would reproduce this bug in a new
+    // spelling. Backslash is a legal POSIX filename character, so this is
+    // Windows-only.
+    if cfg!(windows) {
+        stripped.replace('\\', "/")
+    } else {
+        stripped
+    }
+}
+
+/// Drop a Windows verbatim path prefix, mapping the UNC form back to `\server`.
+/// A path without one is returned unchanged, so this is a no-op off Windows.
+fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = path.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    path.to_string()
+}
+
+/// Compare two `projects` keys as PATHS rather than as strings.
+///
+/// Two spellings of one directory must collide: the host writes
+/// `C:/Users/me/repo` (forward slashes, observed in a real profile) where
+/// canonicalize yields `\?\C:\Users\me\repo`. Only separators, the verbatim
+/// prefix, a trailing separator, and — on Windows only — case may differ; nothing
+/// here resolves links, because both sides are already absolute.
+///
+/// Backslash is a legal filename character on POSIX, so separator folding and
+/// case folding are Windows-only and this stays an identity comparison there.
+fn normalized_project_key(key: &str) -> String {
+    if !cfg!(windows) {
+        return key.trim_end_matches('/').to_string();
+    }
+    let unprefixed = strip_verbatim_prefix(key);
+    let slashed = unprefixed.replace('\\', "/");
+    slashed.trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// The key to actually write under: an existing path-equivalent entry when the
+/// host already has one, else our own canonical spelling.
+///
+/// Reading the config here (rather than inside the mutating helpers) keeps the
+/// reported file label naming the key that is really used.
+fn effective_project_key(claude_json: &Path, project_root: &Path) -> String {
+    let key = project_scope_key(project_root);
+    let Ok(existing) = fs::read_to_string(claude_json) else {
+        return key;
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&existing) else {
+        return key;
+    };
+    let Some(projects) = doc.get("projects").and_then(|v| v.as_object()) else {
+        return key;
+    };
+
+    // Two spellings can name one directory in ways no string rule can bridge:
+    // Windows 8.3 short names (`C:\Users\SPENCE~1\...` for
+    // `C:\Users\SpencerNunamakerTrav\...`), junctions, and symlinks.
+    // Only the filesystem can settle those, so ask it first and keep the string
+    // comparison for keys that no longer exist on disk.
+    let canonical = fs::canonicalize(project_root).ok();
+    let normalized = normalized_project_key(&key);
+    projects
+        .keys()
+        .find(|candidate| {
+            if normalized_project_key(candidate) == normalized {
+                return true;
+            }
+            match (&canonical, fs::canonicalize(Path::new(candidate))) {
+                (Some(wanted), Ok(found)) => &found == wanted,
+                _ => false,
+            }
+        })
+        .cloned()
+        .unwrap_or(key)
 }
 
 /// Upsert every declared server into one Claude `mcpServers` map.
@@ -2895,6 +2982,157 @@ mod tests {
     /// ADPT-05 (2) — the per-project registration is the only scope that can carry a
     /// credential for Claude Code, so it must land under the canonical root, keep its
     /// headers, and leave the top-level map and every other project alone.
+    /// ADPT-12: the key must be the ordinary absolute path, never the Windows
+    /// verbatim form, because that is the spelling the host keys `projects` by.
+    #[test]
+    fn the_project_key_is_never_the_windows_verbatim_form() {
+        let repo = tempfile::tempdir().unwrap();
+        let key = project_scope_key(repo.path());
+        assert!(
+            !key.starts_with(r"\\?\"),
+            "project key must not carry the verbatim prefix, got {key}"
+        );
+    }
+
+    /// Two spellings of one directory must compare equal, so an existing host
+    /// entry is matched rather than duplicated. The forward-slash case is the
+    /// one observed in a real profile.
+    #[test]
+    fn project_keys_that_differ_only_in_spelling_are_the_same_path() {
+        let verbatim = r"\\?\C:\Users\me\repo";
+        let host = "C:/Users/me/repo";
+        let backslashed = r"C:\Users\me\repo";
+        let trailing = "C:/Users/me/repo/";
+
+        if cfg!(windows) {
+            let want = normalized_project_key(host);
+            for other in [verbatim, backslashed, trailing, "C:/USERS/ME/REPO"] {
+                assert_eq!(
+                    normalized_project_key(other),
+                    want,
+                    "{other} must normalize to the same path as {host}"
+                );
+            }
+            assert_ne!(
+                normalized_project_key("C:/Users/me/other"),
+                want,
+                "a genuinely different directory must not collide"
+            );
+        } else {
+            // Backslash is a legal POSIX filename character, so nothing is folded.
+            assert_eq!(normalized_project_key("/home/me/repo"), "/home/me/repo");
+            assert_eq!(normalized_project_key("/home/me/repo/"), "/home/me/repo");
+            assert_ne!(normalized_project_key(backslashed), normalized_project_key(host));
+        }
+    }
+
+    /// A spelling only the filesystem can reconcile: an existing key written
+    /// with a Windows 8.3 short name (`SPENCE~1`) names the same directory as
+    /// its long form, and must be matched rather than duplicated. This is the
+    /// exact shape the sibling repo's uninstall test hits, because TMP on a
+    /// real profile is a short path.
+    #[test]
+    fn an_existing_key_in_a_different_on_disk_spelling_is_matched_not_duplicated() {
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let claude_json = home.path().join(".claude.json");
+
+        // The raw temp path, which on Windows carries the 8.3 short name that
+        // canonicalize expands. On POSIX it equals the canonical form and the
+        // test still asserts the no-duplicate property.
+        let as_written = repo.path().display().to_string();
+        fs::write(
+            &claude_json,
+            serde_json::to_string_pretty(&json!({
+                "projects": { as_written.clone(): { "mcpServers": { "node_repl": { "command": "node" } } } }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        HostInstall::new("todo")
+            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"))
+            .install_user_project_at(&claude_json, repo.path())
+            .unwrap();
+
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        let projects = doc["projects"].as_object().unwrap();
+        assert_eq!(
+            projects.len(),
+            1,
+            "one directory must stay one key, got {:?}",
+            projects.keys().collect::<Vec<_>>()
+        );
+        assert!(projects[&as_written]["mcpServers"]["todo"].is_object());
+        assert!(projects[&as_written]["mcpServers"]["node_repl"].is_object());
+    }
+
+    /// The whole point: installing into a profile that ALREADY has a plain-path
+    /// entry for this repo must land in that entry, not create a second one.
+    #[test]
+    fn installing_matches_an_existing_host_key_instead_of_adding_a_second_entry() {
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let claude_json = home.path().join(".claude.json");
+
+        // The host's own spelling: forward slashes, no verbatim prefix.
+        let host_key = project_scope_key(repo.path()).replace('\\', "/");
+        fs::write(
+            &claude_json,
+            serde_json::to_string_pretty(&json!({
+                "projects": {
+                    host_key.clone(): {
+                        "allowedTools": ["Bash"],
+                        "mcpServers": { "node_repl": { "command": "node" } }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let install = HostInstall::new("todo")
+            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"));
+        install
+            .install_user_project_at(&claude_json, repo.path())
+            .unwrap();
+
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        let projects = doc["projects"].as_object().unwrap();
+        assert_eq!(
+            projects.len(),
+            1,
+            "installing must not add a second key for the same directory, got {:?}",
+            projects.keys().collect::<Vec<_>>()
+        );
+        let entry = &projects[&host_key];
+        assert!(
+            entry["mcpServers"]["todo"].is_object(),
+            "our server must land in the host's own entry"
+        );
+        assert!(
+            entry["mcpServers"]["node_repl"].is_object(),
+            "the unrelated server in that entry must survive"
+        );
+        assert_eq!(entry["allowedTools"][0].as_str(), Some("Bash"));
+
+        // ...and removal finds the same entry, leaving the rest intact.
+        install
+            .remove_user_project_at(&claude_json, repo.path())
+            .unwrap();
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        let entry = &doc["projects"][&host_key];
+        assert!(
+            entry["mcpServers"].get("todo").is_none(),
+            "removal must take our server out of the host's entry"
+        );
+        assert!(
+            entry["mcpServers"]["node_repl"].is_object(),
+            "removal must leave the unrelated server"
+        );
+        assert_eq!(entry["allowedTools"][0].as_str(), Some("Bash"));
+    }
+
     #[test]
     fn a_per_project_claude_registration_lands_scoped_and_spares_other_entries() {
         let home = tempfile::tempdir().unwrap();
