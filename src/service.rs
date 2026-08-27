@@ -12,8 +12,11 @@
 //! and the honesty about what systemd actually reported — is shared.
 
 use crate::http::Hub;
+use crate::service_host::WindowsServiceHostConfig;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+const WINDOWS_SERVICE_HOST: &str = "mcp-hub-supervisor.exe";
 
 /// What an install/uninstall attempt actually did, so the caller reports facts
 /// rather than assuming success.
@@ -226,29 +229,34 @@ impl Service {
         PathBuf::from(format!("\\{}", self.task_name()))
     }
 
-    /// What the task actually launches.
-    ///
-    /// A Scheduled Task has no equivalent of systemd's `Environment=`: the XML
-    /// schema simply cannot carry environment variables. A product that gates its
-    /// own `serve` behind one (semmap does) would therefore install a task that
-    /// its own gate rejects at every start — the precise failure the systemd
-    /// `Environment=` support was added to fix. So when variables are declared the
-    /// action is wrapped in `cmd.exe /c set ... && <exe>`, and when none are
-    /// declared the executable is invoked directly, leaving the common case free
-    /// of a wrapper process.
-    fn windows_action(&self, exe: &str, port: u16) -> (String, String) {
-        if self.env.is_empty() {
-            return (exe.to_string(), format!("serve --port {port}"));
-        }
-        let assignments: String = self
-            .env
-            .iter()
-            .map(|(key, value)| format!("set \"{key}={value}\" && "))
-            .collect();
+    /// What Task Scheduler launches: one GUI-subsystem companion that creates
+    /// the real console server with `CREATE_NO_WINDOW` and keeps it in a
+    /// kill-on-close Job Object. Environment belongs in the persisted config,
+    /// never in a `cmd.exe` wrapper that `/End` can orphan from its child.
+    fn windows_action(&self, exe: &str) -> (PathBuf, PathBuf) {
+        let directory = Path::new(exe).parent().unwrap_or_else(|| Path::new(""));
         (
-            "cmd.exe".to_string(),
-            format!("/c {assignments}\"{exe}\" serve --port {port}"),
+            directory.join(WINDOWS_SERVICE_HOST),
+            directory.join(format!("{}.json", self.task_name())),
         )
+    }
+
+    fn windows_host_config(
+        &self,
+        exe: &str,
+        port: u16,
+        working_dir: &str,
+    ) -> WindowsServiceHostConfig {
+        WindowsServiceHostConfig {
+            executable: exe.to_string(),
+            arguments: vec!["serve".to_string(), "--port".to_string(), port.to_string()],
+            working_directory: working_dir.to_string(),
+            environment: self
+                .env
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        }
     }
 
     /// Render the Scheduled Task registration. Pure, so the XML can be asserted on
@@ -283,10 +291,10 @@ impl Service {
     /// it `schtasks /Create` fails with a bare "Access is denied" on a normal
     /// account — which would make this backend useless for exactly the per-user,
     /// admin-free install it exists to provide.
-    pub fn task_xml(&self, exe: &str, port: u16, working_dir: &str, user_id: &str) -> String {
-        let (command, arguments) = self.windows_action(exe, port);
-        let command = xml_text(&command);
-        let arguments = xml_text(&arguments);
+    pub fn task_xml(&self, exe: &str, _port: u16, working_dir: &str, user_id: &str) -> String {
+        let (command, config_path) = self.windows_action(exe);
+        let command = xml_text(&command.display().to_string());
+        let arguments = xml_text(&format!("\"{}\"", config_path.display()));
         let working_dir = xml_text(working_dir);
         let description = xml_text(self.description);
         let user_id = xml_text(user_id);
@@ -525,12 +533,20 @@ impl Service {
         working_dir: &Path,
     ) -> Result<ServiceOutcome, String> {
         let task = self.task_name();
-        let xml = self.task_xml(
-            &exe.display().to_string(),
-            port,
-            &working_dir.display().to_string(),
-            &windows_user_id(),
-        );
+        let exe_text = exe.display().to_string();
+        let working_dir_text = working_dir.display().to_string();
+        let (host, config_path) = self.windows_action(&exe_text);
+        if !host.is_file() {
+            return Err(format!(
+                "Windows hub supervisor is missing at {}; install {} beside the product binary",
+                host.display(),
+                WINDOWS_SERVICE_HOST
+            ));
+        }
+        let config = self.windows_host_config(&exe_text, port, &working_dir_text);
+        std::fs::write(&config_path, config.to_json()?)
+            .map_err(|error| format!("write {}: {error}", config_path.display()))?;
+        let xml = self.task_xml(&exe_text, port, &working_dir_text, &windows_user_id());
         let xml_file = std::env::temp_dir().join(format!("{task}.xml"));
         std::fs::write(&xml_file, utf16le_with_bom(&xml))
             .map_err(|error| format!("write {}: {error}", xml_file.display()))?;
@@ -583,6 +599,11 @@ impl Service {
                  registered: {}",
                 command_message(&deleted)
             ));
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            let (_, config_path) = self.windows_action(&exe.display().to_string());
+            let _ = std::fs::remove_file(&config_path);
+            let _ = std::fs::remove_file(config_path.with_extension("error.log"));
         }
         Ok(ServiceOutcome::Uninstalled {
             unit_path: self.task_path(),
@@ -1179,13 +1200,17 @@ mod tests {
             "DOM\\me",
         );
         assert!(
-            xml.contains("<Command>C:\\bin\\testprod.exe</Command>"),
+            xml.contains("<Command>C:\\bin\\mcp-hub-supervisor.exe</Command>"),
             "{xml}"
         );
         assert!(
-            xml.contains("<Arguments>serve --port 7977</Arguments>"),
+            xml.contains("<Arguments>&quot;C:\\bin\\testprod-serve.json&quot;</Arguments>"),
             "{xml}"
         );
+        let config =
+            SERVICE.windows_host_config("C:\\bin\\testprod.exe", 7977, "C:\\Users\\someone");
+        assert_eq!(config.executable, "C:\\bin\\testprod.exe");
+        assert_eq!(config.arguments, ["serve", "--port", "7977"]);
         assert!(
             xml.contains("<WorkingDirectory>C:\\Users\\someone</WorkingDirectory>"),
             "{xml}"
@@ -1223,36 +1248,33 @@ mod tests {
         assert!(xml.contains("<LogonTrigger>"), "{xml}");
     }
 
-    /// A Scheduled Task cannot carry environment variables, so a product that
-    /// gates its own `serve` behind one (semmap does) must still get them — or the
-    /// installed task is rejected by that product's gate at every start.
+    /// Product environment is data in the helper config, not shell syntax in
+    /// task XML; the latter creates both a visible console and an orphan seam.
     #[test]
-    fn declared_environment_reaches_the_task_through_a_command_wrapper() {
+    fn declared_environment_reaches_the_windowless_host_config() {
         let service = SERVICE.with_env(&[("PROD_CLI", "1"), ("PROD_MODE", "hub")]);
         let xml = service.task_xml("C:\\bin\\testprod.exe", 7977, "C:\\Users\\x", "DOM\\me");
-        assert!(xml.contains("<Command>cmd.exe</Command>"), "{xml}");
-        let args = &xml[xml.find("<Arguments>").unwrap()..xml.find("</Arguments>").unwrap()];
-        assert!(args.contains("set &quot;PROD_CLI=1&quot;"), "{args}");
-        assert!(args.contains("set &quot;PROD_MODE=hub&quot;"), "{args}");
+        assert!(!xml.contains("cmd.exe"), "{xml}");
         assert!(
-            args.find("PROD_CLI").unwrap() < args.find("PROD_MODE").unwrap(),
-            "declaration order must be preserved: {args}"
+            !xml.contains("PROD_CLI"),
+            "environment must not leak into task XML: {xml}"
         );
-        assert!(
-            args.contains("&amp;&amp;"),
-            "the shell operator must be XML-escaped or the document is malformed: {args}"
-        );
-        assert!(
-            args.contains("testprod.exe&quot; serve --port 7977"),
-            "{args}"
+        let config = service.windows_host_config("C:\\bin\\testprod.exe", 7977, "C:\\Users\\x");
+        assert_eq!(
+            config.environment,
+            [
+                ("PROD_CLI".to_string(), "1".to_string()),
+                ("PROD_MODE".to_string(), "hub".to_string())
+            ]
         );
     }
 
-    /// A product declaring nothing must get no wrapper process at all.
+    /// Every product uses the same windowless direct supervisor, never a shell.
     #[test]
-    fn a_task_with_no_environment_invokes_the_binary_directly() {
+    fn a_task_with_no_environment_still_uses_the_windowless_supervisor() {
         let xml = SERVICE.task_xml("C:\\bin\\testprod.exe", 7977, "C:\\Users\\x", "DOM\\me");
         assert!(!xml.contains("cmd.exe"), "{xml}");
+        assert!(xml.contains("mcp-hub-supervisor.exe"), "{xml}");
     }
 
     /// A path containing XML metacharacters is legal on Windows and must not be
@@ -1260,7 +1282,8 @@ mod tests {
     #[test]
     fn awkward_paths_cannot_break_the_task_xml() {
         let xml = SERVICE.task_xml("C:\\a&b\\<prod>.exe", 7977, "C:\\Users\\o'brien", "DOM\\me");
-        assert!(xml.contains("C:\\a&amp;b\\&lt;prod&gt;.exe"), "{xml}");
+        assert!(xml.contains("C:\\a&amp;b\\mcp-hub-supervisor.exe"), "{xml}");
+        assert!(xml.contains("C:\\a&amp;b\\testprod-serve.json"), "{xml}");
         assert!(xml.contains("o&apos;brien"), "{xml}");
         assert!(
             !xml.contains("<prod>"),
