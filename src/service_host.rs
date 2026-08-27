@@ -1,11 +1,24 @@
 //! Windowless Windows host for a supervised console-subsystem MCP server.
 //!
-//! Task Scheduler cannot request `DETACHED_PROCESS` for an executable action,
-//! and its XML has no environment block. The companion binary reads this
-//! configuration, creates the real server suspended and detached, assigns it
-//! to a kill-on-close Job Object, and only then resumes it. If Task Scheduler
-//! ends the companion, Windows closes the job handle and terminates the whole
-//! server tree rather than leaving an orphan behind.
+//! Task Scheduler cannot request creation flags for an executable action, and
+//! its XML has no environment block. The companion binary reads this
+//! configuration, creates the real server suspended with `CREATE_NO_WINDOW`,
+//! assigns it to a kill-on-close Job Object, and only then resumes it. If Task
+//! Scheduler ends the companion, Windows closes the job handle and terminates
+//! the whole server tree rather than leaving an orphan behind.
+//!
+//! `CREATE_NO_WINDOW`, deliberately, and NOT `DETACHED_PROCESS`. Both leave the
+//! server without a visible window, but they differ in what happens to the
+//! server's OWN children. `CREATE_NO_WINDOW` gives it an invisible console that
+//! every console-subsystem child it spawns inherits silently. `DETACHED_PROCESS`
+//! gives it no console at all, so Windows allocates a fresh, VISIBLE console
+//! window for each such child. A supervised MCP hub shells out to `git`
+//! continuously; measured on 2026-08-27, running it detached filled the desktop
+//! with console windows stealing focus, one per git invocation. The invisible
+//! console is not overhead — it is what absorbs the children.
+//!
+//! Detaching is only safe once every child spawn in the supervised product
+//! passes `CREATE_NO_WINDOW` itself. Until then this flag is load-bearing.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -80,12 +93,12 @@ mod windows {
     };
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
-        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, INFINITE,
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, INFINITE,
         PROCESS_INFORMATION, STARTUPINFOW,
     };
 
     const CHILD_CREATION_FLAGS: u32 =
-        CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT;
+        CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
 
     struct OwnedHandle(HANDLE);
 
@@ -154,7 +167,7 @@ mod windows {
             )
         };
         if created == 0 {
-            return Err(last_error("CreateProcessW(DETACHED_PROCESS)"));
+            return Err(last_error("CreateProcessW(CREATE_NO_WINDOW)"));
         }
         let process_handle = OwnedHandle::new(process.hProcess, "CreateProcessW process handle")?;
         let thread_handle = OwnedHandle::new(process.hThread, "CreateProcessW thread handle")?;
@@ -256,12 +269,16 @@ mod windows {
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
         };
 
+        /// The child gets an INVISIBLE console, never no console. Detaching it
+        /// would make Windows give every `git` the hub spawns its own visible
+        /// console window (measured 2026-08-27); the hidden console is what
+        /// absorbs those children.
         #[test]
-        fn child_is_suspended_and_detached_without_requesting_a_hidden_console() {
+        fn child_is_suspended_with_a_hidden_console_and_is_never_detached() {
             assert_ne!(CHILD_CREATION_FLAGS & CREATE_SUSPENDED, 0);
             assert_ne!(CHILD_CREATION_FLAGS & CREATE_UNICODE_ENVIRONMENT, 0);
-            assert_ne!(CHILD_CREATION_FLAGS & DETACHED_PROCESS, 0);
-            assert_eq!(CHILD_CREATION_FLAGS & CREATE_NO_WINDOW, 0);
+            assert_ne!(CHILD_CREATION_FLAGS & CREATE_NO_WINDOW, 0);
+            assert_eq!(CHILD_CREATION_FLAGS & DETACHED_PROCESS, 0);
         }
 
         #[test]
