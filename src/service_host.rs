@@ -1,8 +1,8 @@
 //! Windowless Windows host for a supervised console-subsystem MCP server.
 //!
-//! Task Scheduler cannot request `CREATE_NO_WINDOW` for an executable action,
+//! Task Scheduler cannot request `DETACHED_PROCESS` for an executable action,
 //! and its XML has no environment block. The companion binary reads this
-//! configuration, creates the real server suspended and windowless, assigns it
+//! configuration, creates the real server suspended and detached, assigns it
 //! to a kill-on-close Job Object, and only then resumes it. If Task Scheduler
 //! ends the companion, Windows closes the job handle and terminates the whole
 //! server tree rather than leaving an orphan behind.
@@ -80,9 +80,12 @@ mod windows {
     };
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
-        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, INFINITE,
+        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, INFINITE,
         PROCESS_INFORMATION, STARTUPINFOW,
     };
+
+    const CHILD_CREATION_FLAGS: u32 =
+        CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT;
 
     struct OwnedHandle(HANDLE);
 
@@ -143,7 +146,7 @@ mod windows {
                 std::ptr::null(),
                 std::ptr::null(),
                 0,
-                CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                CHILD_CREATION_FLAGS,
                 environment.as_ptr() as *const _,
                 current_directory.as_ptr(),
                 &startup,
@@ -151,7 +154,7 @@ mod windows {
             )
         };
         if created == 0 {
-            return Err(last_error("CreateProcessW(CREATE_NO_WINDOW)"));
+            return Err(last_error("CreateProcessW(DETACHED_PROCESS)"));
         }
         let process_handle = OwnedHandle::new(process.hProcess, "CreateProcessW process handle")?;
         let thread_handle = OwnedHandle::new(process.hThread, "CreateProcessW thread handle")?;
@@ -248,7 +251,18 @@ mod windows {
 
     #[cfg(test)]
     mod tests {
-        use super::quote_windows_argument;
+        use super::{quote_windows_argument, CHILD_CREATION_FLAGS};
+        use windows_sys::Win32::System::Threading::{
+            CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
+        };
+
+        #[test]
+        fn child_is_suspended_and_detached_without_requesting_a_hidden_console() {
+            assert_ne!(CHILD_CREATION_FLAGS & CREATE_SUSPENDED, 0);
+            assert_ne!(CHILD_CREATION_FLAGS & CREATE_UNICODE_ENVIRONMENT, 0);
+            assert_ne!(CHILD_CREATION_FLAGS & DETACHED_PROCESS, 0);
+            assert_eq!(CHILD_CREATION_FLAGS & CREATE_NO_WINDOW, 0);
+        }
 
         #[test]
         fn windows_arguments_preserve_spaces_quotes_and_trailing_slashes() {

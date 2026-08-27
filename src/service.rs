@@ -230,7 +230,7 @@ impl Service {
     }
 
     /// What Task Scheduler launches: one GUI-subsystem companion that creates
-    /// the real console server with `CREATE_NO_WINDOW` and keeps it in a
+    /// the real console server with `DETACHED_PROCESS` and keeps it in a
     /// kill-on-close Job Object. Environment belongs in the persisted config,
     /// never in a `cmd.exe` wrapper that `/End` can orphan from its child.
     fn windows_action(&self, exe: &str) -> (PathBuf, PathBuf) {
