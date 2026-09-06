@@ -63,6 +63,12 @@ pub enum Concurrency {
     /// would let one peer that connects and never finishes its request stall
     /// every client behind it.
     Serial,
+    /// Serialize application dispatch without queueing behind busy work. Only
+    /// initialize, server/discover, tools/list, ping, activity/list and initialized
+    /// notifications bypass the lane. The dispatcher must keep these methods
+    /// independent of process-global capture/cwd and application handler state.
+    /// Intended for McpServer::handle_line over HTTP (never stdout responses).
+    SerialWithControlPlane,
 }
 
 /// One product's hub identity: everything about this transport that differs
@@ -627,7 +633,7 @@ impl Hub {
                 // serving inline would have conflated them, letting one peer that
                 // connects and never finishes its request block every later
                 // client for as long as the read deadline allows.
-                Concurrency::Serial => {
+                Concurrency::Serial | Concurrency::SerialWithControlPlane => {
                     let token = token.clone();
                     let dispatch = dispatch.clone();
                     let serial = std::sync::Arc::clone(&serial);
@@ -636,6 +642,38 @@ impl Hub {
                             // Recover from a poisoned lock rather than propagating
                             // it: one handler that panicked must not leave the hub
                             // permanently unable to serve anyone.
+                            if concurrency == Concurrency::SerialWithControlPlane {
+                                let message: serde_json::Value =
+                                    serde_json::from_str(line).unwrap_or_default();
+                                if matches!(
+                                    message.get("method").and_then(serde_json::Value::as_str),
+                                    Some(
+                                        "initialize"
+                                            | "server/discover"
+                                            | "tools/list"
+                                            | "ping"
+                                            | "activity/list"
+                                            | "notifications/initialized"
+                                    )
+                                ) {
+                                    return dispatch(line);
+                                }
+                                let _guard = match serial.try_lock() {
+                                    Ok(guard) => guard,
+                                    Err(std::sync::TryLockError::Poisoned(error)) => {
+                                        error.into_inner()
+                                    }
+                                    Err(std::sync::TryLockError::WouldBlock) => {
+                                        return message.get("id").map(|id| serde_json::json!({
+                                            "jsonrpc": "2.0", "id": id,
+                                            "error": {"code": -32000,
+                                                "message": "Server busy: another application request is running; this request was not executed. Retry after it completes.",
+                                                "data": {"kind": "busy", "retryable": true, "executed": false}}
+                                        }).to_string());
+                                    }
+                                };
+                                return dispatch(line);
+                            }
                             let _guard = serial.lock().unwrap_or_else(|e| e.into_inner());
                             dispatch(line)
                         });
@@ -1210,5 +1248,82 @@ mod tests {
         assert!(reply.starts_with("HTTP/1.1 200 OK"), "got: {reply}");
         assert!(reply.contains(r#""method":"initialize""#));
         assert_eq!(handle.join().unwrap(), 2);
+    }
+}
+
+#[cfg(test)]
+mod responsive_tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::sync::{mpsc, Arc, Mutex};
+
+    fn rpc(addr: SocketAddr, method: &str) -> Value {
+        let body = json!({"jsonrpc":"2.0","id":7,"method":method}).to_string();
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        write!(stream, "POST /mcp HTTP/1.1\r\nAuthorization: Bearer secret\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+    }
+
+    #[test]
+    fn busy_application_does_not_block_control_plane_or_queue_other_tools() {
+        let hub = Hub::new("test", 0);
+        let listener = hub.bind(loopback(0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release = Arc::new(Mutex::new(release_rx));
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&count);
+        std::thread::spawn(move || {
+            hub.run_with(
+                listener,
+                "secret".into(),
+                Concurrency::SerialWithControlPlane,
+                move |line| {
+                    let message: Value = serde_json::from_str(line).unwrap();
+                    if message["method"] == "tools/call" {
+                        let previous = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if previous == 0 {
+                            entered_tx.send(()).unwrap();
+                            release
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(std::time::Duration::from_secs(10))
+                                .unwrap();
+                        }
+                    }
+                    Some(json!({"jsonrpc":"2.0","id":7,"result":{}}).to_string())
+                },
+            )
+            .unwrap();
+        });
+        let running = std::thread::spawn(move || rpc(addr, "tools/call"));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        for method in [
+            "initialize",
+            "server/discover",
+            "tools/list",
+            "ping",
+            "activity/list",
+        ] {
+            assert!(rpc(addr, method).get("result").is_some(), "{method}");
+        }
+        for method in ["tools/call", "resources/read"] {
+            let reply = rpc(addr, method);
+            assert_eq!(reply["error"]["data"]["kind"], "busy");
+            assert_eq!(reply["error"]["data"]["executed"], false);
+        }
+        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        release_tx.send(()).unwrap();
+        assert!(running.join().unwrap().get("result").is_some());
+        assert!(rpc(addr, "tools/call").get("result").is_some());
+        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }
