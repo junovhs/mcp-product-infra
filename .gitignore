@@ -14,3 +14,6 @@ SEMMAP.md
 # semclear check output (regenerable — the dossier artifact and its cache)
 semclear-dossier.json
 .semclear/
+
+# Ishoo writes .bak copies of managed markdown; they are local only.
+*.bak
