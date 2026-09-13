@@ -1982,7 +1982,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // Shells out to flock(1), which is util-linux: absent on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_lock_excludes_another_process_and_releases_on_drop() {
         let dir = tempfile::tempdir().unwrap();

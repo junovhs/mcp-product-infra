@@ -191,10 +191,19 @@ mod tests {
         assert_tree_timeout(spec);
     }
 
+    // The wrapper must have printed its PIDs before the timeout fires, and the
+    // timeout must fire long before the 30 s grandchild would exit on its own.
+    // `sh` is up in milliseconds; Windows PowerShell on a cold hosted runner can
+    // take several seconds just to start, so its budget is wider.
+    #[cfg(unix)]
+    const TREE_TIMEOUT: Duration = Duration::from_secs(1);
+    #[cfg(windows)]
+    const TREE_TIMEOUT: Duration = Duration::from_secs(8);
+
     fn assert_tree_timeout(spec: HandlerCommand) {
         let started = Instant::now();
-        let outcome = run_with_timeout(&spec, Duration::from_secs(1)).unwrap();
-        assert!(started.elapsed() < Duration::from_secs(2));
+        let outcome = run_with_timeout(&spec, TREE_TIMEOUT).unwrap();
+        assert!(started.elapsed() < TREE_TIMEOUT * 2);
         let ProcessOutcome::TimedOut {
             pid,
             tree_terminated,
@@ -267,7 +276,8 @@ mod tests {
                     "[Console]::Out.Write('out'); [Console]::Error.Write('err'); exit 7",
                 ],
             ),
-            Duration::from_secs(2),
+            // PowerShell start-up, not the command, is what needs the room here.
+            Duration::from_secs(15),
         )
         .unwrap();
         let ProcessOutcome::Completed { status, output, .. } = outcome else {
