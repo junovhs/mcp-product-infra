@@ -1191,6 +1191,8 @@ mod tests {
 
     // ---- Windows Scheduled Task -------------------------------------------
 
+    // Feeds `C:\\...` paths through `Path`, which only splits on backslash on Windows.
+    #[cfg(windows)]
     #[test]
     fn the_task_starts_the_running_binary_on_the_requested_port() {
         let xml = SERVICE.task_xml(
@@ -1279,6 +1281,8 @@ mod tests {
 
     /// A path containing XML metacharacters is legal on Windows and must not be
     /// able to produce a document Task Scheduler rejects or misreads.
+    // Feeds `C:\\...` paths through `Path`, which only splits on backslash on Windows.
+    #[cfg(windows)]
     #[test]
     fn awkward_paths_cannot_break_the_task_xml() {
         let xml = SERVICE.task_xml("C:\\a&b\\<prod>.exe", 7977, "C:\\Users\\o'brien", "DOM\\me");

@@ -1360,11 +1360,6 @@ fn normalized_project_key(key: &str) -> String {
     slashed.trim_end_matches('/').to_ascii_lowercase()
 }
 
-/// The key to actually write under: an existing path-equivalent entry when the
-/// host already has one, else our own canonical spelling.
-///
-/// Reading the config here (rather than inside the mutating helpers) keeps the
-/// reported file label naming the key that is really used.
 /// The Windows verbatim prefix. A key carrying it was written by an older
 /// version of THIS crate: measured on a real profile, 0 of 46 host-written
 /// `projects` keys used it and all 8 that did were ours. That is what makes it
@@ -1407,15 +1402,6 @@ fn equivalent_project_keys(claude_json: &Path, project_root: &Path) -> Vec<Strin
         .filter(|candidate| keys_name_one_directory(candidate, &own, canonical.as_deref()))
         .cloned()
         .collect()
-}
-
-/// The key to write under: an existing entry for this root when the host has
-/// one, else our own spelling.
-fn effective_project_key(claude_json: &Path, project_root: &Path) -> String {
-    equivalent_project_keys(claude_json, project_root)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| project_scope_key(project_root))
 }
 
 /// Upsert every declared server into one Claude `mcpServers` map.
@@ -1806,47 +1792,48 @@ fn build_readiness(
         );
 
     let mut repository_adapter = repository_adapter;
-    let (effective_source, configured, result, primary_action, secondary_action) = if repo_blocks_user {
-        repository_adapter.state = "shadowed".to_string();
-        if repository_adapter.detail.is_none() {
-            repository_adapter.detail = Some(
-                "repository adapter overrides the current user/global registration".to_string(),
-            );
-        }
-        (
-            "repository",
-            false,
-            "repository_override_blocks_global",
-            Some("Repair repository setup".to_string()),
-            Some("Remove repository override or add shared repository setup".to_string()),
-        )
-    } else if user_current && repo_current {
-        (
-            "both",
-            true,
-            "configured_both",
-            None,
-            Some("Add shared repository setup".to_string()),
-        )
-    } else if user_current {
-        (
-            "user",
-            true,
-            "configured_globally",
-            None,
-            Some("Add shared repository setup".to_string()),
-        )
-    } else if repo_current {
-        ("repository", true, "configured_repository", None, None)
-    } else {
-        (
-            "none",
-            false,
-            "setup_required",
-            Some("Set up this repo for agents".to_string()),
-            Some("Register user-wide setup".to_string()),
-        )
-    };
+    let (effective_source, configured, result, primary_action, secondary_action) =
+        if repo_blocks_user {
+            repository_adapter.state = "shadowed".to_string();
+            if repository_adapter.detail.is_none() {
+                repository_adapter.detail = Some(
+                    "repository adapter overrides the current user/global registration".to_string(),
+                );
+            }
+            (
+                "repository",
+                false,
+                "repository_override_blocks_global",
+                Some("Repair repository setup".to_string()),
+                Some("Remove repository override or add shared repository setup".to_string()),
+            )
+        } else if user_current && repo_current {
+            (
+                "both",
+                true,
+                "configured_both",
+                None,
+                Some("Add shared repository setup".to_string()),
+            )
+        } else if user_current {
+            (
+                "user",
+                true,
+                "configured_globally",
+                None,
+                Some("Add shared repository setup".to_string()),
+            )
+        } else if repo_current {
+            ("repository", true, "configured_repository", None, None)
+        } else {
+            (
+                "none",
+                false,
+                "setup_required",
+                Some("Set up this repo for agents".to_string()),
+                Some("Register user-wide setup".to_string()),
+            )
+        };
 
     HostReadinessReport {
         host: host.to_string(),
@@ -2791,7 +2778,10 @@ mod tests {
             .iter()
             .find(|report| report.host == "Codex")
             .expect("codex readiness fact");
-        assert!(codex.configured, "http entry must read as configured: {codex:?}");
+        assert!(
+            codex.configured,
+            "http entry must read as configured: {codex:?}"
+        );
         assert_eq!(codex.repository_adapter.state, "current");
 
         // A rotated bearer token must not turn our own entry into foreign drift:
@@ -3091,7 +3081,10 @@ mod tests {
             // Backslash is a legal POSIX filename character, so nothing is folded.
             assert_eq!(normalized_project_key("/home/me/repo"), "/home/me/repo");
             assert_eq!(normalized_project_key("/home/me/repo/"), "/home/me/repo");
-            assert_ne!(normalized_project_key(backslashed), normalized_project_key(host));
+            assert_ne!(
+                normalized_project_key(backslashed),
+                normalized_project_key(host)
+            );
         }
     }
 
@@ -3140,6 +3133,9 @@ mod tests {
     /// spellings of one directory. Removal must clean our servers out of both,
     /// drop the entry only we ever created, and leave the host's entry and its
     /// unrelated contents alone.
+    // Verbatim-prefix twins only arise on Windows; `normalized_project_key` is an
+    // identity everywhere else, so the twin is a distinct directory there.
+    #[cfg(windows)]
     #[test]
     fn removal_cleans_every_spelling_and_drops_only_our_own_empty_entry() {
         let repo = tempfile::tempdir().unwrap();
@@ -3178,8 +3174,7 @@ mod tests {
             .remove_user_project_at(&claude_json, repo.path())
             .unwrap();
 
-        let doc: Value =
-            serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
         let projects = doc["projects"].as_object().unwrap();
 
         // Our litter is gone...
@@ -3222,8 +3217,7 @@ mod tests {
             .remove_user_project_at(&claude_json, repo.path())
             .unwrap();
 
-        let doc: Value =
-            serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
         assert!(
             doc["projects"].as_object().unwrap().contains_key(&host_key),
             "a host-created entry must survive even when we empty it"
@@ -3231,6 +3225,9 @@ mod tests {
     }
 
     /// Setting a project up again heals the twin, without a migration pass.
+    // Verbatim-prefix twins only arise on Windows; `normalized_project_key` is an
+    // identity everywhere else, so the twin is a distinct directory there.
+    #[cfg(windows)]
     #[test]
     fn installing_removes_our_servers_from_the_legacy_twin() {
         let repo = tempfile::tempdir().unwrap();
@@ -3263,8 +3260,7 @@ mod tests {
             .install_user_project_at(&claude_json, repo.path())
             .unwrap();
 
-        let doc: Value =
-            serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
         let projects = doc["projects"].as_object().unwrap();
         assert_eq!(
             projects[&host_key]["mcpServers"]["todo"]["url"].as_str(),
@@ -3309,8 +3305,7 @@ mod tests {
             .remove_user_project_at(&claude_json, repo.path())
             .unwrap();
 
-        let doc: Value =
-            serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
         assert_eq!(
             doc["projects"][&legacy_key]["mcpServers"]["todo"]["url"].as_str(),
             Some("http://somewhere.else/mcp"),
@@ -3342,8 +3337,8 @@ mod tests {
         )
         .unwrap();
 
-        let install = HostInstall::new("todo")
-            .server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"));
+        let install =
+            HostInstall::new("todo").server(HostServer::http("todo", "http://127.0.0.1:7977/mcp"));
         install
             .install_user_project_at(&claude_json, repo.path())
             .unwrap();
