@@ -1164,16 +1164,30 @@ fn append_codex_server(table: &toml::Table, additions: &mut String, server: &Hos
     }
 }
 
-/// Replace every `[mcp_servers.<name>]` table (and its sub-tables) in `text` with
-/// `replacement`, preserving everything else in the file byte-for-byte — comments
-/// and foreign servers included. Returns None when the server is not present.
+/// Replace the `[mcp_servers.<name>]` table and the sub-tables `replacement` owns
+/// in `text` with `replacement`, preserving everything else in the file
+/// byte-for-byte — comments and foreign servers included. Returns None when the
+/// server is not present.
 ///
 /// This exists because the repo config is maintained by text append precisely so
 /// a user's comments survive; a migration still has to rewrite one entry in place,
 /// and reserializing the whole document would discard those comments.
+///
+/// ADPT-14: owning the server entry is not owning every per-tool setting beneath
+/// it. A `[mcp_servers.<name>.tools.<tool>]` table the replacement does not itself
+/// declare (a user's own `approval_mode` for another tool) is kept where it is.
+/// Transport sub-tables are always replaced, since a stale one would mix two
+/// transports. An empty replacement removes the whole group.
 fn replace_codex_server_block(text: &str, name: &str, replacement: &str) -> Option<String> {
     let owned_header = format!("[mcp_servers.{name}]");
     let sub_prefix = format!("[mcp_servers.{name}.");
+    let tools_prefix = format!("[mcp_servers.{name}.tools.");
+    let removing = replacement.trim_end().is_empty();
+    let declared: BTreeSet<&str> = replacement
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('['))
+        .collect();
     let mut out: Vec<String> = Vec::new();
     let mut inserted = false;
     let mut skipping = false;
@@ -1183,14 +1197,16 @@ fn replace_codex_server_block(text: &str, name: &str, replacement: &str) -> Opti
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
             // A new table header always ends any block we were skipping.
-            skipping = trimmed == owned_header || trimmed.starts_with(&sub_prefix);
+            let user_tool =
+                !removing && trimmed.starts_with(&tools_prefix) && !declared.contains(trimmed);
+            skipping = trimmed == owned_header || (trimmed.starts_with(&sub_prefix) && !user_tool);
             if skipping {
                 found = true;
                 if !inserted {
                     inserted = true;
                     // An empty replacement deletes the block. Emitting no separator
                     // then leaves the surrounding blank lines as the user wrote them.
-                    if !replacement.trim_end().is_empty() {
+                    if !removing {
                         for replacement_line in replacement.trim_end().lines() {
                             out.push(replacement_line.to_string());
                         }
@@ -2918,6 +2934,76 @@ mod tests {
             before,
             "second enable must be a no-op"
         );
+    }
+
+    /// ADPT-14: a per-tool table the user added under our server survives the
+    /// migration; only the tables we declare are rewritten.
+    #[test]
+    fn a_migration_keeps_tool_settings_the_install_does_not_declare() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        fs::write(
+            dir.path().join(".codex/config.toml"),
+            "# keep me\n[mcp_servers.todo]\ncommand = \"todo\"\nargs = [\"mcp\"]\n\n\
+             [mcp_servers.todo.tools.todo_decision]\n# mine\napproval_mode = \"approve\"\n\n\
+             [mcp_servers.other]\ncommand = \"other\"\nargs = []\n",
+        )
+        .unwrap();
+        let install = || {
+            HostInstall::new("todo")
+                .server(
+                    HostServer::http("todo", "http://127.0.0.1:7977/mcp")
+                        .header("Authorization", "Bearer tok")
+                        .approve_tool("todo_candidates")
+                        .supersedes(HostTransport::Stdio {
+                            command: "todo".to_string(),
+                            args: vec!["mcp".to_string()],
+                        }),
+                )
+                .install_repo(dir.path())
+                .unwrap();
+        };
+
+        install();
+        let raw = fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
+        let doc: toml::Table = raw.parse().expect("valid TOML after migration");
+        let entry = doc["mcp_servers"]["todo"].as_table().unwrap();
+        assert!(!entry.contains_key("command"), "stdio gone: {raw}");
+        assert_eq!(entry["url"].as_str(), Some("http://127.0.0.1:7977/mcp"));
+        assert_eq!(
+            entry["tools"]["todo_decision"]["approval_mode"].as_str(),
+            Some("approve"),
+            "the user's own tool setting must survive: {raw}"
+        );
+        assert!(raw.contains("# mine"), "kept byte-for-byte: {raw}");
+        assert_eq!(
+            entry["tools"]["todo_candidates"]["approval_mode"].as_str(),
+            Some("approve")
+        );
+        assert!(raw.contains("# keep me"));
+        assert_eq!(
+            doc["mcp_servers"]["other"]["command"].as_str(),
+            Some("other")
+        );
+
+        install();
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap(),
+            raw,
+            "second enable must be a no-op"
+        );
+    }
+
+    /// Removing a server this host no longer receives still takes the whole
+    /// group, user tool tables included: nothing is left dangling without a parent.
+    #[test]
+    fn an_empty_replacement_still_removes_every_sub_table() {
+        let text = "[mcp_servers.todo]\nurl = \"u\"\n\n\
+                    [mcp_servers.todo.tools.mine]\napproval_mode = \"approve\"\n\n\
+                    [mcp_servers.other]\ncommand = \"o\"\n";
+        let out = replace_codex_server_block(text, "todo", "").unwrap();
+        assert_eq!(out, "[mcp_servers.other]\ncommand = \"o\"\n");
     }
 
     #[test]
