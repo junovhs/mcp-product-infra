@@ -58,6 +58,13 @@ pub type BeforeToolHook = Arc<
         + 'static,
 >;
 
+/// Client-side annotation of a completed tool reply: context, tool name,
+/// original arguments (`null` when absent), and the complete JSON-RPC frame.
+/// Runs once after local or resident-owner dispatch, for success and errors.
+/// A panic discards annotations and returns the original completed reply.
+pub type ToolResponseHook =
+    Arc<dyn Fn(&ToolContext, &str, &Value, &mut Value) + Send + Sync + 'static>;
+
 /// Where a completed tool call was executed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DispatchLocation {
@@ -193,6 +200,9 @@ pub struct ServerConfig {
     /// Optional completed-call observer. It receives timing/classification
     /// facts only; exporting, aggregation, and logging remain app concerns.
     pub dispatch_hook: Option<DispatchHook>,
+    /// Optional client reply annotation. Configure on each client/session server,
+    /// not a shared resident owner, when capturing session-specific state.
+    pub tool_response_hook: Option<ToolResponseHook>,
     /// When present, the server answers `resources/list` and `resources/read`
     /// from this provider's enumerated set and advertises the `resources`
     /// capability. When absent both methods stay method-not-found.
@@ -248,6 +258,7 @@ impl ServerConfig {
             mutation_hook: None,
             before_tool: None,
             dispatch_hook: None,
+            tool_response_hook: None,
             resources: None,
             sidecar: None,
             sidecar_required: true,
@@ -303,6 +314,23 @@ impl ServerConfig {
     /// Observe each completed, known `tools/call` without changing its result.
     pub fn on_dispatch(mut self, hook: impl Fn(&DispatchRecord) + Send + Sync + 'static) -> Self {
         self.dispatch_hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Annotate each named, request-shaped `tools/call` reply once, after local
+    /// or resident-owner dispatch, including typed errors. Notifications and
+    /// other methods do not invoke the hook. Arguments are the original wire
+    /// value, or `null` if absent. The frame contains the completed result.
+    ///
+    /// Configure this on the client/session server, not a shared resident owner,
+    /// for session-specific state. A hook panic preserves the original response
+    /// byte-for-byte; it cannot replace an already committed result with an error.
+    /// Without a hook, existing response bytes remain unchanged.
+    pub fn tool_response_hook(
+        mut self,
+        hook: impl Fn(&ToolContext, &str, &Value, &mut Value) + Send + Sync + 'static,
+    ) -> Self {
+        self.tool_response_hook = Some(Arc::new(hook));
         self
     }
 
@@ -517,9 +545,13 @@ impl McpServer {
         self.handle_line_maybe_remote(line, owner)
     }
 
-    /// Handle one JSON-RPC frame in-process. This is what a resident owner should
-    /// call after receiving an owner request.
+    /// Handle one JSON-RPC frame in-process, then annotate the client's completed
+    /// tool reply if configured. Resident owners should omit the client hook.
     pub fn handle_line(&self, line: &str) -> Option<String> {
+        self.annotate_tool_response(line, self.handle_line_local_raw(line))
+    }
+
+    fn handle_line_local_raw(&self, line: &str) -> Option<String> {
         let message: Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(error) => {
@@ -619,15 +651,49 @@ impl McpServer {
         line: &str,
         owner: Option<&OwnerEndpoint>,
     ) -> Option<String> {
+        self.annotate_tool_response(line, self.handle_line_remote_raw(line, owner))
+    }
+
+    fn annotate_tool_response(&self, line: &str, reply: Option<String>) -> Option<String> {
+        let Some(hook) = &self.config.tool_response_hook else {
+            return reply;
+        };
+        let raw = reply?;
+        let Ok(message) = serde_json::from_str::<Value>(line) else {
+            return Some(raw);
+        };
+        if message.get("method").and_then(Value::as_str) != Some("tools/call")
+            || message.get("id").is_none()
+        {
+            return Some(raw);
+        }
+        let Some(name) = message.pointer("/params/name").and_then(Value::as_str) else {
+            return Some(raw);
+        };
+        let arguments = message.pointer("/params/arguments").unwrap_or(&Value::Null);
+        let Ok(mut frame) = serde_json::from_str::<Value>(&raw) else {
+            return Some(raw);
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hook(&self.config.context, name, arguments, &mut frame);
+        }));
+        if outcome.is_err() {
+            Some(raw)
+        } else {
+            Some(frame.to_string())
+        }
+    }
+
+    fn handle_line_remote_raw(&self, line: &str, owner: Option<&OwnerEndpoint>) -> Option<String> {
         // FIX-02: only request-shaped tools/call frames are forwarded — a
         // notification-shaped one is dropped locally (no response, no
         // execution), never sent to the resident owner whose reply the
         // transport would otherwise wait on.
         let Some(owner) = owner.filter(|_| line_calls_tool(line) && line_is_request(line)) else {
-            return self.handle_line(line);
+            return self.handle_line_local_raw(line);
         };
         let Some(sidecar_config) = self.config.sidecar.as_ref() else {
-            return self.handle_line(line);
+            return self.handle_line_local_raw(line);
         };
 
         let prose = &self.config.owner_prose;
@@ -781,12 +847,12 @@ impl McpServer {
         };
         if annotate {
             annotate_read_owner_unreachable(
-                self.handle_line(line),
+                self.handle_line_local_raw(line),
                 error,
                 &self.config.read_annotation_source,
             )
         } else {
-            self.handle_line(line)
+            self.handle_line_local_raw(line)
         }
     }
 
@@ -2892,6 +2958,277 @@ mod tests {
                 .iter()
                 .any(|view| view.label.starts_with("todo_boom")),
             "a panicking handler must not leak its activity lease"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_response_hook_tests {
+    use super::*;
+    use crate::types::{ToolError, ToolSpec};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn call(name: &str, args: Value) -> String {
+        json!({"jsonrpc":"2.0", "id":17, "method":"tools/call", "params":{"name":name,"arguments":args}}).to_string()
+    }
+
+    fn config(root: &std::path::Path) -> ServerConfig {
+        ServerConfig::new("example", "1", root)
+            .tool(ToolSpec::read(
+                "inspect",
+                "Inspect",
+                json!({"type":"object"}),
+                |_, args| Ok(args.clone()),
+            ))
+            .tool(ToolSpec::read(
+                "refuse",
+                "Refuse",
+                json!({"type":"object"}),
+                |_, _| {
+                    Err(ToolError::invalid_params("refused")
+                        .with_kind(kinds::POLICY_REFUSAL)
+                        .with_data(json!({"field":"id"})))
+                },
+            ))
+    }
+
+    fn annotated(config: ServerConfig, count: Arc<AtomicUsize>) -> McpServer {
+        McpServer::new(config.tool_response_hook(move |ctx, name, args, frame| {
+            assert_eq!(ctx.app_name, "example");
+            frame["annotation"] = json!({"count":count.fetch_add(1, Ordering::SeqCst)+1,"name":name,"arguments":args});
+        }))
+    }
+
+    fn frame(raw: Option<String>) -> Value {
+        serde_json::from_str(&raw.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn local_success_and_typed_errors_are_annotated_once_with_original_arguments() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let server = annotated(config(std::path::Path::new(".")), Arc::clone(&count));
+        let args = json!({"id":"record", "labels":[]});
+        let success = frame(server.handle_line(&call("inspect", args.clone())));
+        assert_eq!(success["result"]["structuredContent"], args);
+        assert_eq!(
+            success["annotation"],
+            json!({"count":1,"name":"inspect","arguments":args})
+        );
+        let error = frame(server.handle_line(&call("refuse", json!({"id":null}))));
+        assert_eq!(error["annotation"]["count"], 2);
+        assert_eq!(error["error"]["data"]["kind"], kinds::POLICY_REFUSAL);
+        assert_eq!(error["error"]["data"]["field"], "id");
+        let unknown = frame(server.handle_line(&call("unknown", json!("original-invalid-shape"))));
+        assert_eq!(unknown["annotation"]["arguments"], "original-invalid-shape");
+        assert_eq!(unknown["error"]["data"]["kind"], kinds::INVALID_INPUT);
+        let omitted = frame(server.handle_line(
+            r#"{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"inspect"}}"#,
+        ));
+        assert_eq!(omitted["annotation"]["arguments"], Value::Null);
+        assert_eq!(count.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn ownerless_remote_boundary_does_not_double_annotate_local_fallback() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let server = annotated(config(std::path::Path::new(".")), Arc::clone(&count));
+        let result = frame(server.handle_line_maybe_remote(&call("inspect", json!({})), None));
+        assert_eq!(result["annotation"]["count"], 1);
+        let result = frame(server.handle_line_with_owner(&call("refuse", json!({})), None));
+        assert_eq!(result["annotation"]["count"], 2);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn shared_socket_owner_replies_get_independent_client_annotations_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar =
+            SidecarConfig::new("example", dir.path(), dir.path().join("cache")).app_version("1");
+        let executed = Arc::new(AtomicUsize::new(0));
+        let owner_count = Arc::clone(&executed);
+        let owner_server = McpServer::new(config(dir.path()));
+        let owner = sidecar::test_support::start_owner_thread(sidecar.clone(), move |line| {
+            owner_count.fetch_add(1, Ordering::SeqCst);
+            owner_server.handle_line(line)
+        })
+        .unwrap();
+        let first_count = Arc::new(AtomicUsize::new(0));
+        let second_count = Arc::new(AtomicUsize::new(0));
+        let first = annotated(
+            config(dir.path()).sidecar(sidecar.clone()),
+            Arc::clone(&first_count),
+        );
+        let second = annotated(
+            config(dir.path()).sidecar(sidecar),
+            Arc::clone(&second_count),
+        );
+        for (client, name, expected) in [
+            (&first, "inspect", 1),
+            (&first, "refuse", 2),
+            (&second, "inspect", 1),
+            (&second, "refuse", 2),
+        ] {
+            let response = frame(
+                client.handle_line_with_owner(&call(name, json!({"original":true})), Some(&owner)),
+            );
+            assert_eq!(response["annotation"]["count"], expected);
+            assert_eq!(
+                response["annotation"]["arguments"],
+                json!({"original":true})
+            );
+            if name == "refuse" {
+                assert_eq!(response["error"]["data"]["kind"], kinds::POLICY_REFUSAL);
+            } else {
+                assert_eq!(
+                    response["result"]["structuredContent"],
+                    json!({"original":true})
+                );
+            }
+        }
+        assert_eq!(first_count.load(Ordering::SeqCst), 2);
+        assert_eq!(second_count.load(Ordering::SeqCst), 2);
+        assert_eq!(executed.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn degraded_read_annotations_are_added_before_one_client_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar =
+            SidecarConfig::new("example", dir.path(), dir.path().join("cache")).app_version("1");
+        let unreachable = sidecar::test_support::unreachable_endpoint(&sidecar);
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&count);
+        let server = McpServer::new(config(dir.path()).sidecar(sidecar).tool_response_hook(
+            move |_, _, _, frame| {
+                assert_eq!(
+                    frame["result"]["structuredContent"]["mcp_owner"]["state"],
+                    "unreachable"
+                );
+                frame["annotation"] = json!(observed.fetch_add(1, Ordering::SeqCst) + 1);
+            },
+        ));
+        let response =
+            frame(server.handle_line_with_owner(&call("inspect", json!({})), Some(&unreachable)));
+        assert_eq!(response["annotation"], 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn non_tool_methods_and_notifications_never_invoke_the_hook() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let server = annotated(config(std::path::Path::new(".")), Arc::clone(&count));
+        for method in [
+            "initialize",
+            "tools/list",
+            "ping",
+            "activity/list",
+            "unrecognized",
+        ] {
+            let request = json!({"jsonrpc":"2.0","id":1,"method":method}).to_string();
+            assert!(server.handle_line_with_owner(&request, None).is_some());
+        }
+        assert!(server.handle_line("invalid JSON").is_some());
+        assert!(server.handle_line(r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"inspect","arguments":{}}}"#).is_none());
+        assert!(server
+            .handle_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .is_none());
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn panicking_hook_preserves_committed_local_reply_byte_for_byte() {
+        let applied = Arc::new(AtomicUsize::new(0));
+        let handler_applied = Arc::clone(&applied);
+        let base = ServerConfig::new("example", "1", ".").tool(ToolSpec::write(
+            "commit",
+            "Commit",
+            json!({"type":"object"}),
+            move |_, _| {
+                handler_applied.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"committed":true}))
+            },
+        ));
+        let plain = McpServer::new(base.clone());
+        let hooked = McpServer::new(base.tool_response_hook(|_, _, _, frame| {
+            *frame = json!({"error":"must not escape"});
+            panic!("annotation failed after commit");
+        }));
+        let request = call("commit", json!({}));
+        let original = plain.handle_line(&request).unwrap();
+        assert_eq!(hooked.handle_line(&request).unwrap(), original);
+        assert_eq!(
+            applied.load(Ordering::SeqCst),
+            2,
+            "one application per submitted request"
+        );
+    }
+
+    #[test]
+    fn panicking_hook_preserves_forwarded_success_and_error_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar =
+            SidecarConfig::new("example", dir.path(), dir.path().join("cache")).app_version("1");
+        let successes = " {\"jsonrpc\":\"2.0\",\"id\":17,\"result\":{\"committed\":true}} ";
+        let errors = " {\"jsonrpc\":\"2.0\",\"id\":17,\"error\":{\"code\":-32602,\"data\":{\"kind\":\"policy_refusal\"}}} ";
+        let owner = sidecar::test_support::start_owner_thread(sidecar.clone(), move |line| {
+            let message: Value = serde_json::from_str(line).unwrap();
+            Some(
+                if message["params"]["name"] == "inspect" {
+                    successes
+                } else {
+                    errors
+                }
+                .to_string(),
+            )
+        })
+        .unwrap();
+        let client = McpServer::new(config(dir.path()).sidecar(sidecar).tool_response_hook(
+            |_, _, _, frame| {
+                *frame = Value::Null;
+                panic!("cannot replace owner result");
+            },
+        ));
+        for (name, original) in [("inspect", successes), ("refuse", errors)] {
+            assert_eq!(
+                client
+                    .handle_line_with_owner(&call(name, json!({})), Some(&owner))
+                    .unwrap(),
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn absent_hook_preserves_local_and_forwarded_response_bytes() {
+        let server = McpServer::new(config(std::path::Path::new(".")));
+        for line in [
+            call("inspect", json!({"value":1})),
+            call("refuse", json!({})),
+            "bad JSON".to_string(),
+        ] {
+            assert_eq!(
+                server.handle_line(&line),
+                server.handle_line_local_raw(&line)
+            );
+            assert_eq!(
+                server.handle_line_with_owner(&line, None),
+                server.handle_line_local_raw(&line)
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar =
+            SidecarConfig::new("example", dir.path(), dir.path().join("cache")).app_version("1");
+        let original = " {\"jsonrpc\":\"2.0\",\"id\":17,\"result\":{\"value\":1}} ";
+        let owner = sidecar::test_support::start_owner_thread(sidecar.clone(), move |_| {
+            Some(original.to_string())
+        })
+        .unwrap();
+        let client = McpServer::new(config(dir.path()).sidecar(sidecar));
+        assert_eq!(
+            client
+                .handle_line_with_owner(&call("inspect", json!({})), Some(&owner))
+                .unwrap(),
+            original
         );
     }
 }
