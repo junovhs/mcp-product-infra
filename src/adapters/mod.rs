@@ -193,6 +193,15 @@ pub struct ClaudeHook {
     pub command: String,
 }
 
+/// A repository Codex command hook. An empty matcher omits the matcher field.
+/// Ownership is the exact event, matcher, command type, and command string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexHook {
+    pub event: String,
+    pub matcher: String,
+    pub command: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct HostInstall {
     pub app_name: String,
@@ -202,6 +211,7 @@ pub struct HostInstall {
     pub backup_existing_managed_markdown: bool,
     pub claude_allowed_commands: Vec<String>,
     pub claude_hooks: Vec<ClaudeHook>,
+    pub codex_hooks: Vec<CodexHook>,
 }
 
 impl HostInstall {
@@ -214,6 +224,7 @@ impl HostInstall {
             backup_existing_managed_markdown: false,
             claude_allowed_commands: Vec::new(),
             claude_hooks: Vec::new(),
+            codex_hooks: Vec::new(),
         }
     }
 
@@ -270,6 +281,36 @@ impl HostInstall {
         self
     }
 
+    /// Register a command hook for explicit repository materialization into
+    /// `.codex/hooks.json`. Empty matchers suit events such as UserPromptSubmit.
+    /// Foreign hooks and unknown settings are preserved; malformed files skip.
+    pub fn codex_hook(
+        mut self,
+        event: impl Into<String>,
+        matcher: impl Into<String>,
+        command: impl Into<String>,
+    ) -> Self {
+        self.codex_hooks.push(CodexHook {
+            event: event.into(),
+            matcher: matcher.into(),
+            command: command.into(),
+        });
+        self
+    }
+
+    /// Remove only declared exact Codex command hooks from this repository.
+    /// Retains foreign config and reports the hook file's resulting state.
+    pub fn remove_codex_hooks_repo(&self, repo_root: &Path) -> Result<InstallReport, String> {
+        let root =
+            find_git_root(repo_root).ok_or_else(|| "not inside a git repository".to_string())?;
+        let path = root.join(".codex/hooks.json");
+        let action = with_action(&path, || update_codex_hooks(&path, &self.codex_hooks, true))?;
+        Ok(InstallReport {
+            root,
+            files: vec![(".codex/hooks.json".to_string(), action)],
+        })
+    }
+
     pub fn install_repo(&self, repo_root: &Path) -> Result<InstallReport, String> {
         let repo_root =
             find_git_root(repo_root).ok_or_else(|| "not inside a git repository".to_string())?;
@@ -304,6 +345,18 @@ impl HostInstall {
                 ensure_claude_gitignore(&repo_root)
             })?,
         ));
+        if !self.codex_hooks.is_empty() {
+            files.push((
+                ".codex/hooks.json".to_string(),
+                with_action(&repo_root.join(".codex/hooks.json"), || {
+                    update_codex_hooks(
+                        &repo_root.join(".codex/hooks.json"),
+                        &self.codex_hooks,
+                        false,
+                    )
+                })?,
+            ));
+        }
         if self.managed_markdown_body.is_some() {
             files.push((
                 "CLAUDE.md".to_string(),
@@ -1932,6 +1985,153 @@ fn merge_claude_hooks(
     Ok(())
 }
 
+/// Validate the complete hooks topology before changing anything. Unknown
+/// fields and hook types are retained; malformed containers are never repaired.
+fn valid_codex_hooks(doc: &Value) -> bool {
+    doc.is_object()
+        && doc.get("hooks").is_none_or(|events| {
+            events.as_object().is_some_and(|events| {
+                events.values().all(|groups| {
+                    groups.as_array().is_some_and(|groups| {
+                        groups.iter().all(|group| {
+                            group.is_object()
+                                && group.get("matcher").is_none_or(Value::is_string)
+                                && group.get("hooks").and_then(Value::as_array).is_some_and(
+                                    |entries| {
+                                        entries.iter().all(|entry| {
+                                            entry.is_object()
+                                                && entry.get("type").is_some_and(Value::is_string)
+                                                && (entry.get("type").and_then(Value::as_str)
+                                                    != Some("command")
+                                                    || entry
+                                                        .get("command")
+                                                        .is_some_and(Value::is_string))
+                                        })
+                                    },
+                                )
+                        })
+                    })
+                })
+            })
+        })
+}
+
+fn codex_matcher_matches(group: &Value, matcher: &str) -> bool {
+    group.get("matcher").and_then(Value::as_str).unwrap_or("") == matcher
+}
+
+fn codex_command_matches(entry: &Value, command: &str) -> bool {
+    entry.get("type").and_then(Value::as_str) == Some("command")
+        && entry.get("command").and_then(Value::as_str) == Some(command)
+}
+
+fn update_codex_hooks(
+    path: &Path,
+    hooks: &[CodexHook],
+    remove: bool,
+) -> Result<Materialized, String> {
+    if hooks.is_empty() {
+        return Ok(Materialized::Skipped("no declared Codex hooks".to_string()));
+    }
+    let mut doc = match fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(doc) if valid_codex_hooks(&doc) => doc,
+            _ => {
+                return Ok(Materialized::Skipped(
+                    "Codex hooks config has malformed JSON or hook shape".to_string(),
+                ))
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !remove => json!({}),
+        Err(err) => {
+            return Ok(Materialized::Skipped(format!(
+                "Codex hooks config unavailable: {err}"
+            )))
+        }
+    };
+    let before = doc.clone();
+    if remove && doc.get("hooks").is_none() {
+        return Ok(Materialized::Wrote);
+    }
+    let events = doc
+        .as_object_mut()
+        .expect("validated root")
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .expect("validated hooks");
+    for hook in hooks {
+        if remove && !events.contains_key(&hook.event) {
+            continue;
+        }
+        let groups = events
+            .entry(hook.event.clone())
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .expect("validated event");
+        if remove {
+            groups.retain_mut(|group| {
+                if !codex_matcher_matches(group, &hook.matcher) {
+                    return true;
+                }
+                let entries = group
+                    .get_mut("hooks")
+                    .and_then(Value::as_array_mut)
+                    .expect("validated group");
+                let len = entries.len();
+                entries.retain(|entry| !codex_command_matches(entry, &hook.command));
+                let removed = entries.len() != len;
+                let empty = entries.is_empty();
+                // Preserve groups with foreign settings even after our command leaves.
+                !(removed
+                    && empty
+                    && group
+                        .as_object()
+                        .expect("validated group")
+                        .keys()
+                        .all(|key| key == "hooks" || key == "matcher"))
+            });
+        } else {
+            if groups.iter().any(|group| {
+                codex_matcher_matches(group, &hook.matcher)
+                    && group["hooks"]
+                        .as_array()
+                        .expect("validated group")
+                        .iter()
+                        .any(|entry| codex_command_matches(entry, &hook.command))
+            }) {
+                continue;
+            }
+            let group = groups
+                .iter_mut()
+                .find(|group| codex_matcher_matches(group, &hook.matcher));
+            let entry = json!({"type": "command", "command": hook.command});
+            if let Some(group) = group {
+                let entries = group
+                    .get_mut("hooks")
+                    .and_then(Value::as_array_mut)
+                    .expect("validated group");
+                if !entries
+                    .iter()
+                    .any(|entry| codex_command_matches(entry, &hook.command))
+                {
+                    entries.push(entry);
+                }
+            } else {
+                let mut group = json!({"hooks": [entry]});
+                if !hook.matcher.is_empty() {
+                    group["matcher"] = Value::String(hook.matcher.clone());
+                }
+                groups.push(group);
+            }
+        }
+    }
+    if doc != before {
+        write_json(path, &doc)?;
+    }
+    Ok(Materialized::Wrote)
+}
+
 /// Append one managed line to a host directory's `.gitignore`, creating the file
 /// if it does not exist and leaving every other line — user rules included —
 /// exactly as found.
@@ -2554,6 +2754,149 @@ mod tests {
             fs::read_to_string(path).unwrap(),
             "user introduction\n<!-- ishoo:begin -->\nfresh\n<!-- ishoo:end -->\nuser footer\n"
         );
+    }
+
+    fn codex_hook_action(report: &InstallReport) -> &AdapterAction {
+        &report
+            .files
+            .iter()
+            .find(|(path, _)| path == ".codex/hooks.json")
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn codex_hooks_public_install_and_removal_preserve_foreign_config() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let path = dir.path().join(".codex/hooks.json");
+        let original = json!({
+            "keep": {"unknown": true},
+            "hooks": {
+                "PreToolUse": [{"matcher":"Bash", "hooks":[{"type":"command", "command":"guard"}]}],
+                "UserPromptSubmit": [
+                    {"hooks":[{"type":"command", "command":"foreign", "timeout": 9}]},
+                    {"matcher":"other", "hooks":[{"type":"command", "command":"todo sync"}]},
+                    {"matcher":"", "extra":42, "hooks":[{"type":"prompt", "command":"todo sync", "prompt":"keep"}]}
+                ]
+            }
+        });
+        write_json(&path, &original).unwrap();
+        let install = HostInstall::new("todo").codex_hook("UserPromptSubmit", "", "todo sync");
+        assert_eq!(
+            codex_hook_action(&install.install_repo(dir.path()).unwrap()),
+            &AdapterAction::Updated
+        );
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            codex_hook_action(&install.install_repo(dir.path()).unwrap()),
+            &AdapterAction::Unchanged
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let doc: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            doc["hooks"]["UserPromptSubmit"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(doc["hooks"]["PreToolUse"], original["hooks"]["PreToolUse"]);
+        assert_eq!(
+            doc["hooks"]["UserPromptSubmit"][1],
+            original["hooks"]["UserPromptSubmit"][1]
+        );
+        assert_eq!(
+            doc["hooks"]["UserPromptSubmit"][2],
+            original["hooks"]["UserPromptSubmit"][2]
+        );
+        assert_eq!(
+            codex_hook_action(&install.remove_codex_hooks_repo(dir.path()).unwrap()),
+            &AdapterAction::Updated
+        );
+        let removed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(removed, original);
+        assert_eq!(
+            codex_hook_action(&install.remove_codex_hooks_repo(dir.path()).unwrap()),
+            &AdapterAction::Unchanged
+        );
+    }
+
+    #[test]
+    fn codex_hooks_create_prompt_group_and_surgically_remove_owned_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let path = dir.path().join(".codex/hooks.json");
+        let install = HostInstall::new("todo")
+            .codex_hook("UserPromptSubmit", "", "todo sync")
+            .codex_hook("PreToolUse", "Bash", "todo guard");
+        assert_eq!(
+            codex_hook_action(&install.install_repo(dir.path()).unwrap()),
+            &AdapterAction::Created
+        );
+        let mut doc: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(doc["hooks"]["UserPromptSubmit"][0].get("matcher").is_none());
+        assert_eq!(
+            doc["hooks"]["UserPromptSubmit"][0]["hooks"][0],
+            json!({"type":"command", "command":"todo sync"})
+        );
+        doc["hooks"]["UserPromptSubmit"][0]["keep"] = json!(true);
+        write_json(&path, &doc).unwrap();
+        install.remove_codex_hooks_repo(dir.path()).unwrap();
+        let doc: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc["hooks"]["UserPromptSubmit"][0],
+            json!({"hooks":[],"keep":true})
+        );
+        assert_eq!(doc["hooks"]["PreToolUse"], json!([]));
+    }
+
+    #[test]
+    fn codex_hooks_skip_malformed_and_alien_config_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        let path = dir.path().join(".codex/hooks.json");
+        let install = HostInstall::new("todo").codex_hook("UserPromptSubmit", "", "todo sync");
+        for original in [
+            "{broken",
+            "[]",
+            r#"{"hooks":[]}"#,
+            r#"{"hooks":{"UserPromptSubmit":{}}}"#,
+            r#"{"hooks":{"Stop":[null]}}"#,
+            r#"{"hooks":{"Stop":[{"hooks":"alien"}]}}"#,
+            r#"{"hooks":{"Stop":[{"matcher":false,"hooks":[]}]}}"#,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":42}]}]}}"#,
+        ] {
+            fs::write(&path, original).unwrap();
+            assert!(matches!(
+                codex_hook_action(&install.install_repo(dir.path()).unwrap()),
+                AdapterAction::Skipped(_)
+            ));
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert!(matches!(
+                codex_hook_action(&install.remove_codex_hooks_repo(dir.path()).unwrap()),
+                AdapterAction::Skipped(_)
+            ));
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn codex_hook_existing_exact_command_in_later_group_is_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let path = dir.path().join(".codex/hooks.json");
+        let original = json!({"hooks":{"UserPromptSubmit":[{"hooks":[]},
+            {"hooks":[{"type":"command","command":"todo sync","timeout":7}]}]}});
+        write_json(&path, &original).unwrap();
+        let install = HostInstall::new("todo").codex_hook("UserPromptSubmit", "", "todo sync");
+        assert_eq!(
+            codex_hook_action(&install.install_repo(dir.path()).unwrap()),
+            &AdapterAction::Unchanged
+        );
+        let doc: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(doc, original);
     }
 
     #[test]

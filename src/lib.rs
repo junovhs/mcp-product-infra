@@ -25,8 +25,8 @@ pub mod types;
 
 pub use activity::{ActivityLease, ActivityView};
 pub use adapters::{
-    AdapterAction, ClaudeHook, HostConfigFact, HostInstall, HostReadinessReport, HostServer,
-    HostTransport, InstallReport,
+    AdapterAction, ClaudeHook, CodexHook, HostConfigFact, HostInstall, HostReadinessReport,
+    HostServer, HostTransport, InstallReport,
 };
 pub use http::{Concurrency, Hub};
 pub use manifest::{
