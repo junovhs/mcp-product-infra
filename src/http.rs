@@ -9,10 +9,10 @@
 //! This serves any product's dispatcher over HTTP from a process the host did
 //! not start and cannot kill. The framing is deliberately the smallest thing
 //! that satisfies MCP's Streamable HTTP shape for a local, single-user endpoint:
-//! `POST /mcp` carrying one JSON-RPC message, one JSON message back. There is no
-//! new dispatcher and no new state — [`respond`] is a pure function of the
-//! request and the dispatch closure, which is what makes it testable without a
-//! socket or a store.
+//! `POST /mcp` carrying one JSON-RPC message, one JSON message back. [`respond`]
+//! stays stateless; the opt-in [`SessionServer`] retains independent dispatchers
+//! for legacy clients that initialize an MCP session. Both paths are testable
+//! without a socket or a store.
 //!
 //! Scope is loopback plus a bearer token, by construction: [`Hub::bind`] refuses
 //! any address that is not loopback rather than trusting a caller to pass one.
@@ -21,9 +21,12 @@
 //! default port through [`Hub`]; the wire behavior is identical across products
 //! so a transport fix lands once for all of them.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// The only path that dispatches. Anything else is a 404 — a stray probe must
 /// never reach the tool surface.
@@ -181,6 +184,49 @@ impl Response {
     }
 }
 
+/// Additive session-aware request; the original [`Request`] stays unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRequest {
+    pub request: Request,
+    pub session_id: Option<String>,
+}
+
+impl std::ops::Deref for SessionRequest {
+    type Target = Request;
+    fn deref(&self) -> &Request {
+        &self.request
+    }
+}
+
+/// Additive session-aware response; the original [`Response`] stays unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionResponse {
+    pub response: Response,
+    pub session_id: Option<String>,
+}
+
+impl std::ops::Deref for SessionResponse {
+    type Target = Response;
+    fn deref(&self) -> &Response {
+        &self.response
+    }
+}
+
+impl From<Response> for SessionResponse {
+    fn from(response: Response) -> Self {
+        Self {
+            response,
+            session_id: None,
+        }
+    }
+}
+
+impl SessionResponse {
+    fn new(status: u16, body: impl Into<String>) -> Self {
+        Response::new(status, body).into()
+    }
+}
+
 /// Decide the response for one request.
 ///
 /// Pure on purpose: `dispatch` stands in for `McpServer::handle_line`, so the
@@ -218,6 +264,168 @@ where
     }
 }
 
+/// Maximum retained sessions; expired sessions are reclaimed before admission.
+const MAX_SESSIONS: usize = 1024;
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+type SessionDispatch = dyn Fn(&str) -> Option<String> + Send + Sync + 'static;
+
+struct Session {
+    dispatch: Arc<SessionDispatch>,
+    last_used: Instant,
+}
+
+/// Opt-in legacy MCP HTTP sessions with independent application dispatchers.
+///
+/// A successful `initialize` receives an OS-random `Mcp-Session-Id`; subsequent
+/// requests use that dispatcher until DELETE or 30 minutes of inactivity.
+/// At most 1024 sessions are retained; new initialization is refused with 503
+/// when full. Handlers run outside the session map lock. An already-running
+/// handler can finish after its session is deleted or expires.
+///
+/// Stateless `2026-07-28` messages (`server/discover` or modern protocol metadata)
+/// and no-ID discovery probes (`tools/list`, `ping`, `activity/list`) receive a
+/// fresh, ephemeral dispatcher per request. They retain no per-client state.
+/// Other legacy requests without an ID receive 400. Unknown IDs receive 404,
+/// including on modern messages, rather than silently creating new state.
+/// Existing [`respond`] and [`Hub::run`] remain stateless.
+///
+/// The factory must create independent application state each time it is called.
+pub struct SessionServer {
+    factory: Box<dyn Fn() -> Arc<SessionDispatch> + Send + Sync>,
+    sessions: Mutex<HashMap<String, Session>>,
+}
+
+impl SessionServer {
+    pub fn new<F, D>(factory: F) -> Self
+    where
+        F: Fn() -> D + Send + Sync + 'static,
+        D: Fn(&str) -> Option<String> + Send + Sync + 'static,
+    {
+        Self {
+            factory: Box::new(move || Arc::new(factory())),
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Handle a parsed request. Routing and authentication precede every session
+    /// lookup, expiry update, creation, or deletion.
+    pub fn respond(&self, token: &str, request: &SessionRequest) -> SessionResponse {
+        self.respond_with(token, request, |dispatch, line| dispatch(line))
+    }
+
+    fn respond_with<F>(&self, token: &str, request: &SessionRequest, dispatch: F) -> SessionResponse
+    where
+        F: Fn(&SessionDispatch, &str) -> Option<String>,
+    {
+        if request.path != MCP_PATH {
+            return SessionResponse::new(404, r#"{"error":"not found"}"#);
+        }
+        if request.bearer.as_deref() != Some(token) {
+            return SessionResponse::new(401, r#"{"error":"unauthorized"}"#);
+        }
+        if !matches!(request.method.as_str(), "POST" | "DELETE") {
+            return SessionResponse::new(405, r#"{"error":"method not allowed"}"#);
+        }
+        if let Some(id) = request.session_id.as_deref() {
+            let handler = {
+                let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                sessions.retain(|_, session| session.last_used.elapsed() < SESSION_IDLE_TIMEOUT);
+                if request.method == "DELETE" {
+                    return if sessions.remove(id).is_some() {
+                        SessionResponse::new(204, "")
+                    } else {
+                        SessionResponse::new(404, r#"{"error":"unknown session"}"#)
+                    };
+                }
+                let Some(session) = sessions.get_mut(id) else {
+                    return SessionResponse::new(404, r#"{"error":"unknown session"}"#);
+                };
+                session.last_used = Instant::now();
+                Arc::clone(&session.dispatch)
+            };
+            return respond(|line| dispatch(handler.as_ref(), line), token, request).into();
+        }
+        if request.method == "DELETE" {
+            return SessionResponse::new(400, r#"{"error":"missing session ID"}"#);
+        }
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(&request.body) else {
+            return SessionResponse::new(200, parse_error_frame());
+        };
+        let method = message.get("method").and_then(serde_json::Value::as_str);
+        let initializing = method == Some("initialize");
+        let ephemeral = matches!(
+            method,
+            Some("server/discover" | "tools/list" | "ping" | "activity/list")
+        ) || message
+            .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+            .is_some();
+        if !initializing && !ephemeral {
+            return SessionResponse::new(400, r#"{"error":"missing session ID"}"#);
+        }
+        let handler = (self.factory)();
+        let mut response: SessionResponse =
+            respond(|line| dispatch(handler.as_ref(), line), token, request).into();
+        if !initializing || !successful_initialization(&message, &response) {
+            return response;
+        }
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.retain(|_, session| session.last_used.elapsed() < SESSION_IDLE_TIMEOUT);
+        if sessions.len() >= MAX_SESSIONS {
+            return SessionResponse::new(503, r#"{"error":"session capacity reached"}"#);
+        }
+        let id = loop {
+            let mut bytes = [0u8; 32];
+            if getrandom::fill(&mut bytes).is_err() {
+                return SessionResponse::new(
+                    503,
+                    r#"{"error":"cannot generate session identity"}"#,
+                );
+            }
+            let id = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            if !sessions.contains_key(&id) {
+                break id;
+            }
+        };
+        sessions.insert(
+            id.clone(),
+            Session {
+                dispatch: handler,
+                last_used: Instant::now(),
+            },
+        );
+        response.session_id = Some(id);
+        response
+    }
+}
+
+fn successful_initialization(message: &serde_json::Value, response: &Response) -> bool {
+    let Ok(reply) = serde_json::from_str::<serde_json::Value>(&response.body) else {
+        return false;
+    };
+    response.status == 200
+        && message
+            .get("id")
+            .is_some_and(|id| !id.is_null() && reply.get("id") == Some(id))
+        && reply.get("jsonrpc").and_then(serde_json::Value::as_str) == Some("2.0")
+        && reply.get("error").is_none()
+        && reply
+            .pointer("/result/protocolVersion")
+            .is_some_and(serde_json::Value::is_string)
+        && reply
+            .pointer("/result/capabilities")
+            .is_some_and(serde_json::Value::is_object)
+        && reply
+            .pointer("/result/serverInfo/name")
+            .is_some_and(serde_json::Value::is_string)
+        && reply
+            .pointer("/result/serverInfo/version")
+            .is_some_and(serde_json::Value::is_string)
+}
+
+fn valid_session_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
 fn parse_error_frame() -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -230,6 +438,11 @@ fn parse_error_frame() -> String {
 /// Read one HTTP request. Returns `Ok(None)` when the peer closed without
 /// sending anything, which is an ordinary probe, not an error.
 pub fn read_request(stream: &mut impl Read) -> Result<Option<Request>, String> {
+    read_session_request(stream).map(|request| request.map(|request| request.request))
+}
+
+/// Parse the shared HTTP framing plus an optional `Mcp-Session-Id` header.
+pub fn read_session_request(stream: &mut impl Read) -> Result<Option<SessionRequest>, String> {
     let mut reader = BufReader::new(stream);
     let mut start = String::new();
     if reader
@@ -252,6 +465,7 @@ pub fn read_request(stream: &mut impl Read) -> Result<Option<Request>, String> {
 
     let mut content_length = 0usize;
     let mut bearer = None;
+    let mut session_id = None;
     loop {
         let mut line = String::new();
         if reader
@@ -278,6 +492,12 @@ pub fn read_request(stream: &mut impl Read) -> Result<Option<Request>, String> {
                     return Err(format!("body too large: {content_length} bytes"));
                 }
             }
+            "mcp-session-id" => {
+                if session_id.is_some() || !valid_session_id(value) {
+                    return Err("invalid or duplicate Mcp-Session-Id".to_string());
+                }
+                session_id = Some(value.to_string());
+            }
             "authorization" => {
                 bearer = value
                     .strip_prefix("Bearer ")
@@ -296,12 +516,15 @@ pub fn read_request(stream: &mut impl Read) -> Result<Option<Request>, String> {
     }
     let body = String::from_utf8(body).map_err(|_| "body is not valid UTF-8".to_string())?;
 
-    Ok(Some(Request {
-        method,
-        path,
-        bearer,
-        body,
-        pinned_root,
+    Ok(Some(SessionRequest {
+        request: Request {
+            method,
+            path,
+            bearer,
+            body,
+            pinned_root,
+        },
+        session_id,
     }))
 }
 
@@ -395,17 +618,40 @@ fn apply_pinned_root(body: &str, pinned: Option<&str>) -> String {
 /// honest: one request per connection, so a half-read body can never be
 /// mistaken for the next request's start.
 pub fn write_response(stream: &mut impl Write, response: &Response) -> Result<(), String> {
+    write_response_inner(stream, response, None)
+}
+
+/// Serialize the shared framing with an optional session header.
+pub fn write_session_response(
+    stream: &mut impl Write,
+    response: &SessionResponse,
+) -> Result<(), String> {
+    write_response_inner(stream, &response.response, response.session_id.as_deref())
+}
+
+fn write_response_inner(
+    stream: &mut impl Write,
+    response: &Response,
+    session_id: Option<&str>,
+) -> Result<(), String> {
     let reason = match response.status {
         200 => "OK",
         202 => "Accepted",
+        204 => "No Content",
+        503 => "Service Unavailable",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         _ => "Error",
     };
+    let session_header = match session_id {
+        Some(id) if valid_session_id(id) => format!("Mcp-Session-Id: {id}\r\n"),
+        Some(_) => return Err("invalid response Mcp-Session-Id".to_string()),
+        None => String::new(),
+    };
     let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\n{session_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         response.status,
         reason,
         response.body.len()
@@ -507,6 +753,18 @@ impl Hub {
     where
         F: Fn(&str) -> Option<String> + Clone + Send + 'static,
     {
+        let Some((listener, token)) = self.prepare(port) else {
+            return 1;
+        };
+        let name = self.name;
+        if let Err(error) = self.run_with(listener, token, concurrency, dispatch) {
+            eprintln!("{name} serve: {error}");
+            return 1;
+        }
+        0
+    }
+
+    fn prepare(&self, port: u16) -> Option<(TcpListener, String)> {
         let name = self.name;
         // Bind before touching the token. A second `serve` losing the port race
         // must fail without having written anything: the token is shared state a
@@ -517,21 +775,21 @@ impl Hub {
             Ok(listener) => listener,
             Err(error) => {
                 eprintln!("{name} serve: {error}");
-                return 1;
+                return None;
             }
         };
         let token_path = match self.token_path() {
             Ok(path) => path,
             Err(error) => {
                 eprintln!("{name} serve: {error}");
-                return 1;
+                return None;
             }
         };
         let token = match ensure_token(&token_path) {
             Ok(token) => token,
             Err(error) => {
                 eprintln!("{name} serve: {error}");
-                return 1;
+                return None;
             }
         };
         let bound = listener.local_addr().unwrap_or(addr);
@@ -541,11 +799,7 @@ impl Hub {
         println!("  host config: url = \"http://{bound}/mcp\"");
         println!("  bearer:      {token}");
 
-        if let Err(error) = self.run_with(listener, token, concurrency, dispatch) {
-            eprintln!("{name} serve: {error}");
-            return 1;
-        }
-        0
+        Some((listener, token))
     }
 
     /// Serve each accepted connection on its own thread through `dispatch`.
@@ -570,10 +824,9 @@ impl Hub {
 
     /// [`Hub::run`] with an explicit [`Concurrency`] policy.
     ///
-    /// Under [`Concurrency::Serial`] a connection is served to completion on this
-    /// thread before the next is accepted, so a product whose handlers touch
-    /// process-global state stays correct. The loopback guard and the
-    /// accept-failure policy are identical under both policies.
+    /// Under [`Concurrency::Serial`] only dispatch holds the shared lane; socket
+    /// reads remain concurrent so a stalled peer cannot hold other clients.
+    /// The loopback guard and accept-failure policy are identical for all lanes.
     pub fn run_with<F>(
         &self,
         listener: TcpListener,
@@ -583,6 +836,86 @@ impl Hub {
     ) -> Result<(), String>
     where
         F: Fn(&str) -> Option<String> + Clone + Send + 'static,
+    {
+        let serial = Arc::new(Mutex::new(()));
+        self.run_responses(listener, move |request| {
+            respond(
+                |line| dispatch_with_policy(concurrency, &serial, line, |line| dispatch(line)),
+                &token,
+                request,
+            )
+            .into()
+        })
+    }
+
+    /// Stateful counterpart of [`Hub::serve`]. Each initialized client receives
+    /// an independent dispatcher created by `factory`.
+    pub fn serve_sessions<F, D>(&self, port: u16, factory: F) -> i32
+    where
+        F: Fn() -> D + Send + Sync + 'static,
+        D: Fn(&str) -> Option<String> + Send + Sync + 'static,
+    {
+        self.serve_sessions_with(port, Concurrency::Threaded, factory)
+    }
+
+    /// Stateful serving with the same process-wide application lane as
+    /// [`Hub::serve_with`], shared across all client sessions.
+    pub fn serve_sessions_with<F, D>(&self, port: u16, concurrency: Concurrency, factory: F) -> i32
+    where
+        F: Fn() -> D + Send + Sync + 'static,
+        D: Fn(&str) -> Option<String> + Send + Sync + 'static,
+    {
+        let Some((listener, token)) = self.prepare(port) else {
+            return 1;
+        };
+        if let Err(error) = self.run_sessions_with(listener, token, concurrency, factory) {
+            eprintln!("{} serve: {error}", self.name);
+            return 1;
+        }
+        0
+    }
+
+    /// Serve legacy sessions and ephemeral discovery/stateless requests. Checks
+    /// loopback even for a caller-supplied listener, like [`Hub::run`].
+    pub fn run_sessions<F, D>(
+        &self,
+        listener: TcpListener,
+        token: String,
+        factory: F,
+    ) -> Result<(), String>
+    where
+        F: Fn() -> D + Send + Sync + 'static,
+        D: Fn(&str) -> Option<String> + Send + Sync + 'static,
+    {
+        self.run_sessions_with(listener, token, Concurrency::Threaded, factory)
+    }
+
+    /// [`Hub::run_sessions`] with an explicit concurrency policy. All sessions
+    /// share one application dispatch lane; use this when handlers require
+    /// serialization or a responsive control plane instead of threaded dispatch.
+    pub fn run_sessions_with<F, D>(
+        &self,
+        listener: TcpListener,
+        token: String,
+        concurrency: Concurrency,
+        factory: F,
+    ) -> Result<(), String>
+    where
+        F: Fn() -> D + Send + Sync + 'static,
+        D: Fn(&str) -> Option<String> + Send + Sync + 'static,
+    {
+        let sessions = Arc::new(SessionServer::new(factory));
+        let serial = Arc::new(Mutex::new(()));
+        self.run_responses(listener, move |request| {
+            sessions.respond_with(&token, request, |dispatch, line| {
+                dispatch_with_policy(concurrency, &serial, line, |line| dispatch(line))
+            })
+        })
+    }
+
+    fn run_responses<F>(&self, listener: TcpListener, handler: F) -> Result<(), String>
+    where
+        F: Fn(&SessionRequest) -> SessionResponse + Clone + Send + 'static,
     {
         match listener.local_addr() {
             Ok(addr) if addr.ip().is_loopback() => {}
@@ -599,9 +932,6 @@ impl Hub {
                 ))
             }
         }
-        // Held across every connection under `Concurrency::Serial`, so exactly one
-        // dispatch runs at a time for the life of the hub.
-        let serial = std::sync::Arc::new(std::sync::Mutex::new(()));
         for stream in listener.incoming() {
             let mut stream = match stream {
                 Ok(stream) => stream,
@@ -610,78 +940,66 @@ impl Hub {
                     continue;
                 }
             };
-            // A client that connects and then stalls must not hold the hub. Under
-            // `Serial` this is the difference between one slow peer and a dead
-            // service: the accept loop is the only thread there is, so a peer that
-            // opens a connection and never finishes its request would block every
-            // subsequent connection forever. Under `Threaded` it merely leaks one
-            // thread, but the deadline is right in both cases and is applied here,
-            // once, so no policy can be correct-by-accident.
             let _ = stream.set_read_timeout(Some(STALLED_PEER_TIMEOUT));
             let _ = stream.set_write_timeout(Some(STALLED_PEER_TIMEOUT));
-            match concurrency {
-                Concurrency::Threaded => {
-                    let token = token.clone();
-                    let dispatch = dispatch.clone();
-                    std::thread::spawn(move || {
-                        serve_connection(&mut stream, &token, |line| dispatch(line));
-                    });
-                }
-                // Still a thread per connection, with a lock around `dispatch`
-                // alone. What a serial product needs is that no two *handlers*
-                // run at once, not that no two sockets are open at once — and
-                // serving inline would have conflated them, letting one peer that
-                // connects and never finishes its request block every later
-                // client for as long as the read deadline allows.
-                Concurrency::Serial | Concurrency::SerialWithControlPlane => {
-                    let token = token.clone();
-                    let dispatch = dispatch.clone();
-                    let serial = std::sync::Arc::clone(&serial);
-                    std::thread::spawn(move || {
-                        serve_connection(&mut stream, &token, |line| {
-                            // Recover from a poisoned lock rather than propagating
-                            // it: one handler that panicked must not leave the hub
-                            // permanently unable to serve anyone.
-                            if concurrency == Concurrency::SerialWithControlPlane {
-                                let message: serde_json::Value =
-                                    serde_json::from_str(line).unwrap_or_default();
-                                if matches!(
-                                    message.get("method").and_then(serde_json::Value::as_str),
-                                    Some(
-                                        "initialize"
-                                            | "server/discover"
-                                            | "tools/list"
-                                            | "ping"
-                                            | "activity/list"
-                                            | "notifications/initialized"
-                                    )
-                                ) {
-                                    return dispatch(line);
-                                }
-                                let _guard = match serial.try_lock() {
-                                    Ok(guard) => guard,
-                                    Err(std::sync::TryLockError::Poisoned(error)) => {
-                                        error.into_inner()
-                                    }
-                                    Err(std::sync::TryLockError::WouldBlock) => {
-                                        return message.get("id").map(|id| serde_json::json!({
-                                            "jsonrpc": "2.0", "id": id,
-                                            "error": {"code": -32000,
-                                                "message": "Server busy: another application request is running; this request was not executed. Retry after it completes.",
-                                                "data": {"kind": "busy", "retryable": true, "executed": false}}
-                                        }).to_string());
-                                    }
-                                };
-                                return dispatch(line);
-                            }
-                            let _guard = serial.lock().unwrap_or_else(|e| e.into_inner());
-                            dispatch(line)
-                        });
-                    });
-                }
-            }
+            let handler = handler.clone();
+            std::thread::spawn(move || {
+                let response = match read_session_request(&mut stream) {
+                    Ok(None) => return,
+                    Ok(Some(request)) => handler(&request),
+                    Err(error) => {
+                        SessionResponse::new(400, serde_json::json!({"error": error}).to_string())
+                    }
+                };
+                let _ = write_session_response(&mut stream, &response);
+            });
         }
         Ok(())
+    }
+}
+
+fn dispatch_with_policy<F>(
+    concurrency: Concurrency,
+    serial: &Mutex<()>,
+    line: &str,
+    dispatch: F,
+) -> Option<String>
+where
+    F: FnOnce(&str) -> Option<String>,
+{
+    match concurrency {
+        Concurrency::Threaded => dispatch(line),
+        Concurrency::Serial => {
+            let _guard = serial.lock().unwrap_or_else(|e| e.into_inner());
+            dispatch(line)
+        }
+        Concurrency::SerialWithControlPlane => {
+            let message: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+            if matches!(
+                message.get("method").and_then(serde_json::Value::as_str),
+                Some(
+                    "initialize"
+                        | "server/discover"
+                        | "tools/list"
+                        | "ping"
+                        | "activity/list"
+                        | "notifications/initialized"
+                )
+            ) {
+                return dispatch(line);
+            }
+            let _guard = match serial.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return message.get("id").map(|id| serde_json::json!({
+                        "jsonrpc":"2.0", "id":id,
+                        "error":{"code":-32000,"message":"Server busy: another application request is running; this request was not executed. Retry after it completes.","data":{"kind":"busy","retryable":true,"executed":false}}
+                    }).to_string());
+                }
+            };
+            dispatch(line)
+        }
     }
 }
 
@@ -699,6 +1017,7 @@ mod tests {
             method: method.to_string(),
             path: path.to_string(),
             bearer: bearer.map(str::to_string),
+
             body: body.to_string(),
             pinned_root: None,
         }
@@ -1325,5 +1644,333 @@ mod responsive_tests {
         assert!(running.join().unwrap().get("result").is_some());
         assert!(rpc(addr, "tools/call").get("result").is_some());
         assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn request(method: &str, session_id: Option<&str>) -> SessionRequest {
+        SessionRequest {
+            request: Request {
+                method: "POST".to_string(),
+                path: "/mcp".to_string(),
+                bearer: Some("secret".to_string()),
+                body: json!({"jsonrpc":"2.0", "id":1, "method":method}).to_string(),
+                pinned_root: None,
+            },
+            session_id: session_id.map(str::to_string),
+        }
+    }
+
+    fn counter() -> impl Fn(&str) -> Option<String> + Send + Sync {
+        let count = AtomicUsize::new(0);
+        move |line| {
+            let message: Value = serde_json::from_str(line).unwrap();
+            let result = if message["method"] == "initialize" {
+                json!({"protocolVersion":"2025-06-18", "capabilities":{}, "serverInfo":{"name":"counter", "version":"1"}})
+            } else {
+                json!({"count": count.fetch_add(1, Ordering::SeqCst) + 1})
+            };
+            message
+                .get("id")
+                .map(|id| json!({"jsonrpc":"2.0","id":id,"result":result}).to_string())
+        }
+    }
+
+    fn initialize(server: &SessionServer) -> String {
+        let response = server.respond("secret", &request("initialize", None));
+        assert_eq!(response.status, 200);
+        let id = response
+            .session_id
+            .expect("initialization must create a session");
+        assert_eq!(id.len(), 64);
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+        id
+    }
+
+    fn count(server: &SessionServer, id: Option<&str>) -> usize {
+        let response = server.respond("secret", &request("tools/call", id));
+        assert_eq!(response.status, 200);
+        serde_json::from_str::<Value>(&response.body).unwrap()["result"]["count"]
+            .as_u64()
+            .unwrap() as usize
+    }
+
+    #[test]
+    fn sessions_are_independent_and_same_id_preserves_dispatch_state() {
+        let server = SessionServer::new(counter);
+        let first = initialize(&server);
+        let second = initialize(&server);
+        assert_ne!(first, second);
+        assert_eq!(count(&server, Some(&first)), 1);
+        assert_eq!(count(&server, Some(&first)), 2);
+        assert_eq!(count(&server, Some(&second)), 1);
+    }
+
+    #[test]
+    fn missing_unknown_deleted_and_expired_sessions_have_typed_http_statuses() {
+        let server = SessionServer::new(counter);
+        assert_eq!(
+            server
+                .respond("secret", &request("tools/call", None))
+                .status,
+            400
+        );
+        assert_eq!(
+            server
+                .respond("secret", &request("tools/call", Some("unknown")))
+                .status,
+            404
+        );
+        let first = initialize(&server);
+        let mut delete = request("", Some(&first));
+        delete.request.method = "DELETE".to_string();
+        let response = server.respond("secret", &delete);
+        assert_eq!(response.status, 204);
+        assert!(response.body.is_empty());
+        assert_eq!(server.respond("secret", &delete).status, 404);
+        assert_eq!(
+            server
+                .respond("secret", &request("tools/call", Some(&first)))
+                .status,
+            404
+        );
+        delete.session_id = None;
+        assert_eq!(server.respond("secret", &delete).status, 400);
+        let expired = initialize(&server);
+        server
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&expired)
+            .unwrap()
+            .last_used = Instant::now() - SESSION_IDLE_TIMEOUT;
+        assert_eq!(
+            server
+                .respond("secret", &request("tools/call", Some(&expired)))
+                .status,
+            404
+        );
+    }
+
+    #[test]
+    fn authentication_and_routing_precede_all_session_changes() {
+        let made = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&made);
+        let server = SessionServer::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            counter()
+        });
+        let mut init = request("initialize", None);
+        init.request.bearer = None;
+        assert_eq!(server.respond("secret", &init).status, 401);
+        init.request.path = "/wrong".to_string();
+        assert_eq!(server.respond("secret", &init).status, 404);
+        assert_eq!(made.load(Ordering::SeqCst), 0);
+        let id = initialize(&server);
+        let stamp = Instant::now() - SESSION_IDLE_TIMEOUT;
+        server
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .last_used = stamp;
+        let mut delete = request("", Some(&id));
+        delete.request.method = "DELETE".to_string();
+        delete.request.bearer = None;
+        assert_eq!(server.respond("secret", &delete).status, 401);
+        delete.request.bearer = Some("secret".to_string());
+        delete.request.path = "/wrong".to_string();
+        assert_eq!(server.respond("secret", &delete).status, 404);
+        let sessions = server.sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[&id].last_used, stamp,
+            "rejection must not touch or expire sessions"
+        );
+    }
+
+    #[test]
+    fn failed_or_notification_initialization_does_not_retain_identity() {
+        for reply in [
+            None,
+            Some("invalid"),
+            Some(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602}}"#),
+            Some(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#),
+            Some(
+                r#"{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"x","version":"1"}}}"#,
+            ),
+        ] {
+            let server = SessionServer::new(move || move |_: &str| reply.map(str::to_string));
+            let response = server.respond("secret", &request("initialize", None));
+            assert!(response.session_id.is_none());
+            assert!(server.sessions.lock().unwrap().is_empty());
+        }
+        let server = SessionServer::new(counter);
+        let mut notification = request("initialize", None);
+        notification.request.body = json!({"jsonrpc":"2.0","method":"initialize"}).to_string();
+        assert_eq!(server.respond("secret", &notification).status, 202);
+        assert!(server.sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn modern_messages_and_discovery_probes_get_only_ephemeral_state() {
+        let server = SessionServer::new(counter);
+        for method in ["server/discover", "tools/list", "ping", "activity/list"] {
+            for _ in 0..2 {
+                let response = server.respond("secret", &request(method, None));
+                assert_eq!(response.status, 200);
+                assert!(response.session_id.is_none());
+                assert_eq!(
+                    serde_json::from_str::<Value>(&response.body).unwrap()["result"]["count"],
+                    1
+                );
+            }
+        }
+        let mut modern = request("tools/call", None);
+        modern.request.body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}).to_string();
+        for _ in 0..2 {
+            let response = server.respond("secret", &modern);
+            assert_eq!(response.status, 200);
+            assert_eq!(
+                serde_json::from_str::<Value>(&response.body).unwrap()["result"]["count"],
+                1
+            );
+        }
+        modern.session_id = Some("unknown".to_string());
+        assert_eq!(server.respond("secret", &modern).status, 404);
+        assert!(server.sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn retained_sessions_are_bounded_and_expiry_reclaims_capacity() {
+        let server = SessionServer::new(counter);
+        for _ in 0..MAX_SESSIONS {
+            initialize(&server);
+        }
+        let response = server.respond("secret", &request("initialize", None));
+        assert_eq!(response.status, 503);
+        assert!(response.session_id.is_none());
+        let mut sessions = server.sessions.lock().unwrap();
+        assert_eq!(sessions.len(), MAX_SESSIONS);
+        sessions.values_mut().next().unwrap().last_used = Instant::now() - SESSION_IDLE_TIMEOUT;
+        drop(sessions);
+        initialize(&server);
+        assert_eq!(server.sessions.lock().unwrap().len(), MAX_SESSIONS);
+    }
+
+    #[test]
+    fn application_dispatch_runs_outside_the_session_map_lock() {
+        let server = SessionServer::new(counter);
+        let init = server.respond_with("secret", &request("initialize", None), |dispatch, line| {
+            assert!(server.sessions.try_lock().is_ok());
+            dispatch(line)
+        });
+        let id = init.session_id.unwrap();
+        let response = server.respond_with(
+            "secret",
+            &request("tools/call", Some(&id)),
+            |dispatch, line| {
+                assert!(server.sessions.try_lock().is_ok());
+                dispatch(line)
+            },
+        );
+        assert_eq!(response.status, 200);
+    }
+
+    #[test]
+    fn header_parsing_serialization_and_original_struct_literals_are_compatible() {
+        let mut wire = std::io::Cursor::new(
+            b"POST /mcp HTTP/1.1\r\nmCp-SeSsIoN-iD: opaque-id\r\nContent-Length: 2\r\n\r\n{}"
+                .to_vec(),
+        );
+        let parsed = read_session_request(&mut wire).unwrap().unwrap();
+        assert_eq!(parsed.session_id.as_deref(), Some("opaque-id"));
+        let response = SessionResponse {
+            response: Response {
+                status: 200,
+                body: "{}".to_string(),
+            },
+            session_id: Some("opaque-id".to_string()),
+        };
+        let mut bytes = Vec::new();
+        write_session_response(&mut bytes, &response).unwrap();
+        assert!(String::from_utf8(bytes)
+            .unwrap()
+            .contains("\r\nMcp-Session-Id: opaque-id\r\n"));
+        let mut ordinary = Vec::new();
+        write_response(&mut ordinary, &response.response).unwrap();
+        assert!(!String::from_utf8(ordinary)
+            .unwrap()
+            .contains("Mcp-Session-Id"));
+        for headers in [
+            "Mcp-Session-Id: \r\n",
+            "Mcp-Session-Id: one\r\nMcp-Session-Id: two\r\n",
+            "Mcp-Session-Id: has space\r\n",
+        ] {
+            let mut wire = std::io::Cursor::new(format!("POST /mcp HTTP/1.1\r\n{headers}\r\n"));
+            assert!(read_session_request(&mut wire).is_err());
+        }
+        let malicious = SessionResponse {
+            response: response.response,
+            session_id: Some("id\r\nInjected: true".to_string()),
+        };
+        assert!(write_session_response(&mut Vec::new(), &malicious).is_err());
+    }
+
+    fn exchange(addr: SocketAddr, method: &str, id: Option<&str>, body: &str) -> String {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let header = id
+            .map(|id| format!("Mcp-Session-Id: {id}\r\n"))
+            .unwrap_or_default();
+        write!(stream, "{method} /mcp HTTP/1.1\r\nAuthorization: Bearer secret\r\n{header}Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    #[test]
+    fn actual_http_clients_initialize_continue_independently_and_delete_sessions() {
+        let hub = Hub::new("session-test", 7977);
+        let listener = hub.bind(loopback(0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            hub.run_sessions(listener, "secret".to_string(), counter)
+                .unwrap()
+        });
+        let init = request("initialize", None).body.clone();
+        let ids: Vec<_> = (0..2)
+            .map(|_| {
+                let response = exchange(addr, "POST", None, &init);
+                assert!(response.starts_with("HTTP/1.1 200 OK"));
+                response
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Mcp-Session-Id: "))
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_ne!(ids[0], ids[1]);
+        let body = request("tools/call", None).body.clone();
+        for (id, expected) in [(&ids[0], 1), (&ids[0], 2), (&ids[1], 1)] {
+            let response = exchange(addr, "POST", Some(id), &body);
+            assert!(response.starts_with("HTTP/1.1 200 OK"));
+            assert_eq!(
+                serde_json::from_str::<Value>(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+                    ["result"]["count"],
+                expected
+            );
+        }
+        assert!(exchange(addr, "POST", None, &body).starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(exchange(addr, "DELETE", Some(&ids[0]), "").starts_with("HTTP/1.1 204 No Content"));
+        assert!(exchange(addr, "POST", Some(&ids[0]), &body).starts_with("HTTP/1.1 404 Not Found"));
     }
 }
