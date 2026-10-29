@@ -1,14 +1,1 @@
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "command": "ishoo agent-notice",
-            "type": "command"
-          }
-        ]
-      }
-    ]
-  }
-}
+{}
